@@ -5,7 +5,9 @@ import asyncio
 from typing import Dict, Any, List, Optional
 from playwright.async_api import Page, Frame, ElementHandle
 from field_rules import get_field_match_by_rules
+from field_lookup import lookup_field_value, LookupStage
 from ai_client import ai_interpret_field, ai_match_saved_answers, ai_generate_tailored_answer
+from widget_executors import WidgetType, widget_registry, verify_filled_widgets
 
 async def detect_security_checkpoint(page: Page) -> Optional[str]:
     """
@@ -846,15 +848,21 @@ async def fill_form_on_page(
                             if not is_required:
                                 continue
 
-                        # Attach the file directly into hidden or styled input[type="file"] via CDP
-                        await el.set_input_files(resume_path)
-                        # Dispatch events so React/Vue/Angular state updates immediately
-                        await el.evaluate("""(e) => {
-                            e.dispatchEvent(new Event('input', { bubbles: true }));
-                            e.dispatchEvent(new Event('change', { bubbles: true }));
-                        }""")
-                        result["fields_filled"].append({"field": label or "Resume Upload", "value": os.path.basename(resume_path)})
-                        record_filled(el_id, name, label or "Resume Upload", tag, "file", resume_path, selector=f"#{el_id}" if el_id else "")
+                        # Use FileWidgetExecutor (fills & verifies attachment in DOM)
+                        file_exec = widget_registry.get_executor(WidgetType.FILE)
+                        exec_res = await file_exec.execute(ctx, el, resume_path)
+                        if exec_res.success:
+                            fname = os.path.basename(resume_path)
+                            result["fields_filled"].append({
+                                "field": label or "Resume Upload",
+                                "value": fname,
+                                "type": "file",
+                                "id": el_id,
+                                "name": name,
+                                "selector": f"#{el_id}" if el_id else "",
+                                "verified": exec_res.verified_value
+                            })
+                            record_filled(el_id, name, label or "Resume Upload", tag, "file", resume_path, selector=f"#{el_id}" if el_id else "")
                     except Exception as e:
                         print(f"File upload error on '{label}': {e}")
                 continue
@@ -971,78 +979,21 @@ async def fill_form_on_page(
                     except Exception as e:
                         print(f"Error opening combobox: {e}")
 
-                # E. If matched_val is known, select it
-                if matched_val and options:
-                    for o_text in options:
-                        if o_text.lower() == str(matched_val).strip().lower():
-                            matched_val = o_text
-                            break
-                    m_lower = str(matched_val).strip().lower()
-                    if m_lower.startswith("no"):
-                        for o_text in options:
-                            if o_text.lower() == "no":
-                                matched_val = o_text
-                                break
-                    elif m_lower.startswith("yes"):
-                        for o_text in options:
-                            if o_text.lower() == "yes":
-                                matched_val = o_text
-                                break
-
-                    opt_match = None
-                    if listbox:
-                        opt_match = await listbox.query_selector(f'[role="option"]:has-text("{matched_val}"), .select__option:has-text("{matched_val}")')
-                    if not opt_match:
-                        opt_match = await ctx.query_selector(f'[role="option"]:has-text("{matched_val}"), .select__option:has-text("{matched_val}")') or await page.query_selector(f'[role="option"]:has-text("{matched_val}"), .select__option:has-text("{matched_val}")')
-
-                    if opt_match:
-                        await opt_match.click()
-                        await asyncio.sleep(0.3)
-                        result["fields_filled"].append({"field": label, "value": str(matched_val)})
+                # E. If matched_val is known, select via CustomComboboxWidgetExecutor
+                if matched_val:
+                    exec_res = await widget_registry.get_executor(WidgetType.CUSTOM_COMBOBOX).execute(ctx, el, matched_val)
+                    if exec_res.success:
+                        result["fields_filled"].append({
+                            "field": label,
+                            "value": str(matched_val),
+                            "type": "combobox",
+                            "id": el_id,
+                            "name": name,
+                            "selector": f"#{el_id}" if el_id else "",
+                            "verified": exec_res.verified_value
+                        })
                         record_filled(el_id, name, label, tag, "combobox", str(matched_val))
                         continue
-                    else:
-                        # Virtualized list handling: type into combobox to filter DOM, or scroll popup
-                        try:
-                            await el.fill(str(matched_val))
-                            await asyncio.sleep(0.3)
-                            # Re-check if filtering revealed the option
-                            if listbox:
-                                opt_match = await listbox.query_selector(f'[role="option"]:has-text("{matched_val}"), .select__option:has-text("{matched_val}")')
-                            if not opt_match:
-                                opt_match = await ctx.query_selector(f'[role="option"]:has-text("{matched_val}"), .select__option:has-text("{matched_val}")') or await page.query_selector(f'[role="option"]:has-text("{matched_val}"), .select__option:has-text("{matched_val}")')
-
-                            if opt_match:
-                                await opt_match.click()
-                                await asyncio.sleep(0.3)
-                                result["fields_filled"].append({"field": label, "value": str(matched_val)})
-                                record_filled(el_id, name, label, tag, "combobox", str(matched_val))
-                                continue
-
-                            # If still not found, scroll virtualized list container
-                            if listbox:
-                                for scroll_ratio in [0.25, 0.5, 0.75, 1.0]:
-                                    await listbox.evaluate(f"(box) => box.scrollTop = box.scrollHeight * {scroll_ratio}")
-                                    await asyncio.sleep(0.15)
-                                    opt_match = await listbox.query_selector(f'[role="option"]:has-text("{matched_val}"), .select__option:has-text("{matched_val}")')
-                                    if opt_match:
-                                        await opt_match.click()
-                                        await asyncio.sleep(0.3)
-                                        result["fields_filled"].append({"field": label, "value": str(matched_val)})
-                                        record_filled(el_id, name, label, tag, "combobox", str(matched_val))
-                                        break
-                                if opt_match:
-                                    continue
-
-                            # Fallback: keyboard navigation
-                            await page.keyboard.press("ArrowDown")
-                            await page.keyboard.press("Enter")
-                            await asyncio.sleep(0.3)
-                            result["fields_filled"].append({"field": label, "value": str(matched_val)})
-                            record_filled(el_id, name, label, tag, "combobox", str(matched_val))
-                            continue
-                        except Exception as e:
-                            print(f"Error selecting virtualized option for {label}: {e}")
 
                 await page.keyboard.press("Escape")
                 await asyncio.sleep(0.2)
@@ -1159,64 +1110,36 @@ async def fill_form_on_page(
                     matched_val = get_field_match_by_rules(label, profile)
 
                 if matched_val:
-                    m_lower = str(matched_val).strip().lower()
-                    for ot in opt_texts:
-                        if ot.lower() == m_lower or (m_lower == "yes" and ot.lower() == "yes") or (m_lower == "no" and ot.lower() == "no"):
-                            matched_val = ot
-                            break
-
-                    applied = await el.evaluate("""(sel, target) => {
-                        let match = null;
-                        let tLow = target.toLowerCase().trim();
-                        for (let o of sel.options) {
-                            let oText = o.text.toLowerCase().trim();
-                            let oVal = o.value.toLowerCase().trim();
-                            if (oText === tLow || oVal === tLow || oText.includes(tLow) || tLow.includes(oText)) {
-                                match = o;
-                                break;
-                            }
-                        }
-                        if (match) {
-                            sel.value = match.value;
-                            sel.dispatchEvent(new Event('change', { bubbles: true }));
-                            if (window.jQuery && window.jQuery(sel).data('select2')) {
-                                window.jQuery(sel).val(match.value).trigger('change');
-                            }
-                            return true;
-                        }
-                        return false;
-                    }""", str(matched_val))
-
-                    if applied:
-                        result["fields_filled"].append({"field": label, "value": str(matched_val)})
+                    exec_res = await widget_registry.get_executor(WidgetType.NATIVE_SELECT).execute(ctx, el, matched_val)
+                    if exec_res.success:
+                        result["fields_filled"].append({
+                            "field": label,
+                            "value": str(matched_val),
+                            "type": "select",
+                            "id": el_id,
+                            "name": name,
+                            "selector": f"#{el_id}" if el_id else "",
+                            "verified": exec_res.verified_value
+                        })
                         record_filled(el_id, name, label, tag, "select", str(matched_val))
                         continue
-                    else:
-                        try:
-                            await el.select_option(label=str(matched_val), timeout=2000)
-                            result["fields_filled"].append({"field": label, "value": str(matched_val)})
-                            record_filled(el_id, name, label, tag, "select", str(matched_val))
-                            continue
-                        except Exception:
-                            pass
 
-                # D. Pause for unconfirmed select dropdown
+                # D. Pause for unconfirmed select dropdown -> Collect into batch
                 ai_decision = ""
                 if opt_texts:
                     opt_texts_to_pass = opt_texts[:20]
                     ai_decision = await ai_generate_tailored_answer(label, profile, job_context=job_context, options=opt_texts_to_pass)
 
                 field_id = await el.get_attribute("id") or name or label
-                result["needs_input"] = True
-                result["unanswered_question"] = {
-                    "field_id": field_id,
-                    "label": label,
-                    "type": "select",
-                    "options": opt_texts[:25]
-                }
-                result["ai_suggestion"] = ai_decision or (opt_texts[0] if opt_texts else "")
-                result["completed"] = False
-                return result
+                collect_unanswered_question(
+                    field_id=field_id,
+                    label=label,
+                    field_type="select",
+                    options=opt_texts[:25],
+                    ai_suggestion=ai_decision or (opt_texts[0] if opt_texts else ""),
+                    category="general"
+                )
+                continue
 
             # =========================================================================
             # 4. RADIO BUTTON GROUPS
@@ -1245,29 +1168,32 @@ async def fill_form_on_page(
                     matched_val = get_field_match_by_rules(group_label, profile)
 
                 if matched_val:
-                    m_lower = str(matched_val).strip().lower()
-                    for r_el in group_radios:
-                        r_lbl = await get_option_label(ctx, r_el)
-                        if r_lbl.lower() == m_lower or (m_lower == "yes" and r_lbl.lower().startswith("yes")) or (m_lower == "no" and r_lbl.lower().startswith("no")):
-                            await r_el.click()
-                            result["fields_filled"].append({"field": group_label, "value": r_lbl})
-                            record_filled(el_id, name, group_label, "input", "radio", r_lbl)
-                            break
-                    continue
+                    exec_res = await widget_registry.get_executor(WidgetType.RADIO).execute(ctx, el, matched_val)
+                    if exec_res.success:
+                        result["fields_filled"].append({
+                            "field": group_label,
+                            "value": str(matched_val),
+                            "type": "radio",
+                            "id": el_id,
+                            "name": name,
+                            "selector": f'[name="{name}"]' if name else "",
+                            "verified": exec_res.verified_value
+                        })
+                        record_filled(el_id, name, group_label, "input", "radio", str(matched_val))
+                        continue
 
-                # Pause on unknown radio group
+                # Pause on unknown radio group -> Collect into batch
                 ai_decision = await ai_generate_tailored_answer(group_label, profile, job_context=job_context, options=radio_options or ["Yes", "No"])
                 field_id = await el.get_attribute("id") or name or group_label
-                result["needs_input"] = True
-                result["unanswered_question"] = {
-                    "field_id": field_id,
-                    "label": group_label,
-                    "type": "select",
-                    "options": radio_options or ["Yes", "No"]
-                }
-                result["ai_suggestion"] = ai_decision or (radio_options[0] if radio_options else "Yes")
-                result["completed"] = False
-                return result
+                collect_unanswered_question(
+                    field_id=field_id,
+                    label=group_label,
+                    field_type="select",
+                    options=radio_options or ["Yes", "No"],
+                    ai_suggestion=ai_decision or (radio_options[0] if radio_options else "Yes"),
+                    category="general"
+                )
+                continue
 
             # =========================================================================
             # 5. CHECKBOXES (Consent, Terms, Acknowledgment)
@@ -1284,23 +1210,30 @@ async def fill_form_on_page(
                 # unless explicitly approved and stored in reusable memory.
                 matched_val = await ai_match_saved_answers(checkbox_label, saved_answers, company_name=job_context)
                 if matched_val and str(matched_val).lower() in ["yes", "true", "check", "1", opt_lbl.lower()]:
-                    await el.check()
-                    result["fields_filled"].append({"field": checkbox_label, "value": opt_lbl or "Checked (User Approved)"})
-                    record_filled(el_id, name, checkbox_label, "input", "checkbox", "Yes")
-                    continue
+                    exec_res = await widget_registry.get_executor(WidgetType.CHECKBOX).execute(ctx, el, "Yes")
+                    if exec_res.success:
+                        result["fields_filled"].append({
+                            "field": checkbox_label,
+                            "value": opt_lbl or "Checked (User Approved)",
+                            "type": "checkbox",
+                            "id": el_id,
+                            "name": name,
+                            "selector": f"#{el_id}" if el_id else "",
+                            "verified": exec_res.verified_value
+                        })
+                        record_filled(el_id, name, checkbox_label, "input", "checkbox", "Yes")
+                        continue
 
-                # Pause on consent / agreement / required checkboxes
+                # Pause on consent / agreement / required checkboxes -> Collect into batch
                 field_id = await el.get_attribute("id") or name or checkbox_label
-                result["needs_input"] = True
-                result["unanswered_question"] = {
-                    "field_id": field_id,
-                    "label": checkbox_label,
-                    "type": "select",
-                    "options": ["Yes", "No"]
-                }
-                result["ai_suggestion"] = "Yes"
-                result["completed"] = False
-                return result
+                collect_unanswered_question(
+                    field_id=field_id,
+                    label=checkbox_label,
+                    field_type="checkbox",
+                    options=["Yes", "No"],
+                    ai_suggestion="Yes",
+                    category="legal"
+                )
                 continue
 
             # =========================================================================
@@ -1317,12 +1250,21 @@ async def fill_form_on_page(
                     matched_val = await ai_match_saved_answers(label, saved_answers, company_name=job_context)
 
                 if matched_val:
-                    await set_date_on_element(el, str(matched_val))
-                    result["fields_filled"].append({"field": label, "value": str(matched_val)})
-                    record_filled(el_id, name, label, tag, "date", str(matched_val))
-                    continue
+                    exec_res = await widget_registry.get_executor(WidgetType.DATE).execute(ctx, el, str(matched_val))
+                    if exec_res.success:
+                        result["fields_filled"].append({
+                            "field": label,
+                            "value": str(matched_val),
+                            "type": "date",
+                            "id": el_id,
+                            "name": name,
+                            "selector": f"#{el_id}" if el_id else "",
+                            "verified": exec_res.verified_value
+                        })
+                        record_filled(el_id, name, label, tag, "date", str(matched_val))
+                        continue
 
-                # Prompt user with HTML5 interactive datepicker
+                # Prompt user with HTML5 interactive datepicker -> Collect into batch
                 field_id = await el.get_attribute("id") or name or label
                 suggested_date = "2024-05-15"
                 if "reliev" in label.lower() or "end" in label.lower():
@@ -1330,16 +1272,15 @@ async def fill_form_on_page(
                 elif "birth" in label.lower() or "dob" in label.lower():
                     suggested_date = "2004-10-03"
 
-                result["needs_input"] = True
-                result["unanswered_question"] = {
-                    "field_id": field_id,
-                    "label": label,
-                    "type": "date",
-                    "options": []
-                }
-                result["ai_suggestion"] = suggested_date
-                result["completed"] = False
-                return result
+                collect_unanswered_question(
+                    field_id=field_id,
+                    label=label,
+                    field_type="date",
+                    options=[],
+                    ai_suggestion=suggested_date,
+                    category="timeline"
+                )
+                continue
 
             # =========================================================================
             # 7. TEXT, EMAIL, PHONE, AND TEXTAREA INPUTS
@@ -1381,41 +1322,38 @@ async def fill_form_on_page(
                         matched_value = await ai_generate_tailored_answer(label, profile, job_context=job_context)
 
                 if matched_value:
-                    # Numeric input safety (input[type="number"] requires digits or decimals)
-                    if inp_type == "number":
-                        num_match = re.search(r'\d+(?:\.\d+)?', str(matched_value))
-                        matched_value = num_match.group(0) if num_match else "0"
-
-                    # Check for masked inputs (e.g. placeholder with (___) or xxx-xxx)
-                    ph = (await el.get_attribute("placeholder") or "").lower()
-                    if any(m in ph for m in ["(___)", "xxx-xxx", "___-___", "(123)"]):
-                        await el.focus()
-                        await el.type(str(matched_value), delay=30)
-                    else:
-                        await el.fill(str(matched_value))
-                    result["fields_filled"].append({"field": label, "value": str(matched_value)})
-                    record_filled(el_id, name, label, tag, inp_type or "text", str(matched_value), selector=f"#{el_id}" if el_id else "")
-                    continue
+                    exec_res = await widget_registry.get_executor(WidgetType.TEXT).execute(ctx, el, matched_value)
+                    if exec_res.success:
+                        result["fields_filled"].append({
+                            "field": label,
+                            "value": str(matched_value),
+                            "type": "text",
+                            "id": el_id,
+                            "name": name,
+                            "selector": f"#{el_id}" if el_id else "",
+                            "verified": exec_res.verified_value
+                        })
+                        record_filled(el_id, name, label, tag, inp_type or "text", str(matched_value), selector=f"#{el_id}" if el_id else "")
+                        continue
 
                 # Skip optional notes
                 is_optional = any(word in label.lower() for word in ["optional", "not required", "if you would like"])
                 if is_optional:
                     continue
 
-                # Pause on unknown text / custom questions
+                # Pause on unknown text / custom questions -> Collect into batch
                 field_id = await el.get_attribute("id") or name or label
                 suggested_ans = await ai_generate_tailored_answer(label, profile, job_context=job_context) or ""
 
-                result["needs_input"] = True
-                result["unanswered_question"] = {
-                    "field_id": field_id,
-                    "label": label,
-                    "type": "text",
-                    "options": []
-                }
-                result["ai_suggestion"] = suggested_ans
-                result["completed"] = False
-                return result
+                collect_unanswered_question(
+                    field_id=field_id,
+                    label=label,
+                    field_type="text",
+                    options=[],
+                    ai_suggestion=suggested_ans,
+                    category="general"
+                )
+                continue
 
         except Exception as e:
             print(f"Error handling form element [{el_idx}]: {e}")
@@ -1435,6 +1373,24 @@ async def fill_form_on_page(
                 record_filled("resume", "resume", "Resume Upload", "input", "file", resume_path)
         except Exception:
             pass
+
+    # BATCH UNANSWERED QUESTIONS CHECK:
+    # If any unknown questions were collected on this page, return the complete batch!
+    if unanswered_questions:
+        result["needs_input"] = True
+        result["unanswered_questions"] = unanswered_questions
+        result["unanswered_question"] = unanswered_questions[0]
+        result["ai_suggestion"] = unanswered_questions[0].get("ai_suggestion", "")
+        result["completed"] = False
+        print(f"[FormFiller] Collected batch of {len(unanswered_questions)} unknown questions on page.")
+        return result
+
+    # POST-FILL VERIFY STEP: Dedicated verification re-reads every filled widget from live DOM!
+    verify_report = await verify_filled_widgets(ctx, result["fields_filled"])
+    result["verification_report"] = verify_report
+    print(f"[Widget Verification] Re-read {verify_report['verified_count']}/{verify_report['total_checked']} filled widgets in DOM.")
+    if not verify_report["all_passed"]:
+        print(f"[Widget Verification Warning] {verify_report['failed_count']} filled widgets failed re-read check!")
 
     # POST-FILL VALIDATION & REQUIRED-FIELD VERIFICATION (Re-reads all fields)
     verification = await verify_form_completion_and_errors(ctx)
