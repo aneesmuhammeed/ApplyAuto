@@ -1,9 +1,12 @@
-# reload-trigger-1
 import os
+import re
+import hmac
+import uuid
 import shutil
-from typing import Dict, Any, List
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from typing import Dict, Any, List, Optional
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from config import settings
@@ -17,15 +20,56 @@ from resume_parser import parse_resume
 
 app = FastAPI(title="ApplyMate Local API", version="2.0.0")
 
+# Security: Restrict CORS strictly to dashboard origins and local loopback
+allowed_origins = [
+    settings.DASHBOARD_ORIGIN,
+    "http://localhost:3000",
+    "http://127.0.0.1:3000"
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
 os.makedirs(settings.RESUME_STORAGE_DIR, exist_ok=True)
+
+# Security: Authentication Middleware enforcing random token header created on first run
+@app.middleware("http")
+async def verify_token_header(request: Request, call_next):
+    # 1. Allow CORS preflight requests
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    # 2. Allow open health checks and OpenAPI docs
+    if request.url.path in ["/health", "/docs", "/openapi.json"]:
+        return await call_next(request)
+
+    # 3. Allow authorized dashboard origin / local loopback to bootstrap the token
+    if request.url.path == "/api/auth/token":
+        origin = request.headers.get("origin")
+        client_host = request.client.host if request.client else ""
+        if origin in allowed_origins or client_host in ["127.0.0.1", "::1", "localhost"]:
+            return JSONResponse({"status": "success", "token": settings.API_TOKEN})
+        return JSONResponse({"status": "error", "detail": "Unauthorized origin"}, status_code=403)
+
+    # 4. Require X-API-Token or Bearer Authorization header
+    token = request.headers.get("X-API-Token")
+    if not token and "authorization" in request.headers:
+        auth_val = request.headers["authorization"]
+        if auth_val.lower().startswith("bearer "):
+            token = auth_val[7:].strip()
+
+    if not token or not hmac.compare_digest(str(token), str(settings.API_TOKEN)):
+        return JSONResponse(
+            status_code=401,
+            content={"status": "error", "detail": "Unauthorized: Invalid or missing X-API-Token header"}
+        )
+
+    return await call_next(request)
 
 # Pydantic schemas
 class NewApplicationRequest(BaseModel):
@@ -39,6 +83,21 @@ class UpdateApplicationRequest(BaseModel):
     save_answer_for_future: bool = False
     answer_category: str = "general"
     answer_scope: str = "global"
+
+class BatchAnswerItem(BaseModel):
+    id: Optional[str] = None
+    field_id: Optional[str] = None
+    question_key: Optional[str] = None
+    label: str
+    type: str = "text"
+    options: Optional[List[str]] = []
+    answer: str
+    scope: str = "global"
+    save_for_future: bool = True
+    category: str = "general"
+
+class BatchAnswerRequest(BaseModel):
+    batch_answers: List[BatchAnswerItem]
 
 class SavedAnswerRequest(BaseModel):
     question_pattern: str
@@ -90,6 +149,47 @@ def update_app_task(app_id: str, req: UpdateApplicationRequest):
     update_application(app_id, updates)
     return {"status": "success"}
 
+@app.post("/api/applications/{app_id}/answer_batch")
+def answer_application_batch(app_id: str, req: BatchAnswerRequest):
+    app_data = get_application(app_id)
+    if not app_data:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    answers_list = [item.dict() for item in req.batch_answers]
+    company_name = app_data.get("company_name", "")
+
+    saved_count = 0
+    for ans in answers_list:
+        if ans.get("save_for_future") and ans.get("answer"):
+            try:
+                create_saved_answer(
+                    pattern=ans["label"],
+                    answer=ans["answer"],
+                    field_type=ans.get("type", "text"),
+                    category=ans.get("category", "general"),
+                    scope=ans.get("scope", "global"),
+                    company_name=company_name if ans.get("scope") in ["this company", "company"] else "",
+                    options_seen=ans.get("options", []),
+                    source="user"
+                )
+                saved_count += 1
+            except Exception as e:
+                print(f"[API Warning] Failed to save answer to memory: {e}")
+
+    update_application(app_id, {
+        "status": "processing",
+        "batch_answers": answers_list,
+        "unanswered_questions": [],
+        "unanswered_question": None,
+        "stage_message": f"Received {len(answers_list)} answers. Resuming autofill..."
+    })
+
+    return {
+        "status": "success",
+        "saved_count": len(answers_list),
+        "persisted_to_memory": saved_count
+    }
+
 @app.delete("/api/applications/{app_id}")
 def remove_application(app_id: str):
     delete_application(app_id)
@@ -133,17 +233,68 @@ def save_profile(data: Dict[str, Any]):
     update_profile(data)
     return {"status": "success"}
 
+# Security: Strict resume upload policies
+MAX_RESUME_SIZE = 10 * 1024 * 1024  # 10 MB limit
+ALLOWED_EXTENSIONS = {".pdf", ".docx"}
+ALLOWED_MIME_TYPES = {
+    "application/pdf",
+    "application/x-pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/zip",
+    "application/x-zip-compressed",
+    "application/octet-stream"
+}
+
 @app.post("/api/resume/upload")
 async def upload_resume(file: UploadFile = File(...)):
-    """Upload resume, extract structured info strictly from text, store in local SQLite."""
-    allowed_exts = [".pdf", ".docx", ".doc"]
-    ext = os.path.splitext(file.filename)[1].lower()
-    if ext not in allowed_exts:
-        raise HTTPException(status_code=400, detail="Only PDF and DOCX files are supported.")
+    """
+    Secure Resume Upload:
+    1. Rejects .doc explicitly and restricts extensions strictly to .pdf and .docx.
+    2. Enforces maximum file size limit (10MB).
+    3. Validates MIME type and magic file signatures (%PDF- and PK\x03\x04).
+    4. Saves file under a cryptographically random UUID filename to prevent traversal and overwrites.
+    """
+    original_name = os.path.basename(file.filename or "")
+    ext = os.path.splitext(original_name)[1].lower()
 
-    file_dest = os.path.join(settings.RESUME_STORAGE_DIR, file.filename)
+    # Reject .doc explicitly and enforce allowed extensions
+    if ext == ".doc":
+        raise HTTPException(
+            status_code=400,
+            detail="Legacy .doc format is rejected for security reasons. Please upload .pdf or .docx."
+        )
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF and modern DOCX files are supported."
+        )
+
+    # Validate MIME type
+    content_type = (file.content_type or "").lower().split(";")[0].strip()
+    if content_type and content_type not in ALLOWED_MIME_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid MIME type: '{content_type}'. Only PDF and DOCX files are allowed."
+        )
+
+    # Read contents and validate size
+    contents = await file.read()
+    if len(contents) == 0:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    if len(contents) > MAX_RESUME_SIZE:
+        raise HTTPException(status_code=400, detail="File size exceeds maximum allowed limit (10MB).")
+
+    # Validate file magic bytes
+    if ext == ".pdf" and not contents.startswith(b"%PDF-"):
+        raise HTTPException(status_code=400, detail="File header does not match valid PDF signature.")
+    if ext == ".docx" and not contents.startswith(b"PK\x03\x04"):
+        raise HTTPException(status_code=400, detail="File header does not match valid DOCX package signature.")
+
+    # Save under a random UUID-based name to avoid collisions and path manipulation
+    safe_filename = f"{uuid.uuid4().hex}{ext}"
+    file_dest = os.path.join(settings.RESUME_STORAGE_DIR, safe_filename)
     with open(file_dest, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+        buffer.write(contents)
 
     parsed = parse_resume(file_dest)
 
@@ -171,7 +322,8 @@ async def upload_resume(file: UploadFile = File(...)):
 
     return {
         "status": "success",
-        "file_name": file.filename,
+        "file_name": original_name,
+        "stored_file_name": safe_filename,
         "parsed_summary": {
             "full_name": profile_update["full_name"],
             "email": profile_update["email"],
@@ -217,3 +369,8 @@ def reparse_resume():
         "message": "Resume successfully re-parsed into structured profile!",
         "profile": get_profile()
     }
+
+if __name__ == "__main__":
+    import uvicorn
+    # Bind explicitly to 127.0.0.1 loopback
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

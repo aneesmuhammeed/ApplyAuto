@@ -1,23 +1,37 @@
 import os
+import re
 import json
 import urllib.request
 import urllib.parse
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
-def get_telegram_config():
+def sanitize_log(msg: str) -> str:
+    """Strip any Telegram bot tokens or credentials from log strings."""
+    # Redact /bot<token>/ and bot tokens of format \d+:[A-Za-z0-9_-]+
+    cleaned = re.sub(r'bot\d+:[A-Za-z0-9_\-]+', 'bot[REDACTED_TOKEN]', str(msg))
+    cleaned = re.sub(r'\/bot[^\/]+\/', '/bot[REDACTED_TOKEN]/', cleaned)
+    return cleaned
+
+def get_telegram_config() -> Tuple[Optional[str], Optional[str]]:
+    """
+    Securely load Telegram bot token and chat ID.
+    Never prints or logs the token or chat ID.
+    """
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        # Check backend/.env
         env_path = os.path.join(os.path.dirname(__file__), ".env")
         if os.path.exists(env_path):
-            with open(env_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("TELEGRAM_BOT_TOKEN=") and not token:
-                        token = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    elif line.startswith("TELEGRAM_CHAT_ID=") and not chat_id:
-                        chat_id = line.split("=", 1)[1].strip().strip('"').strip("'")
+            try:
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("TELEGRAM_BOT_TOKEN=") and not token:
+                            token = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        elif line.startswith("TELEGRAM_CHAT_ID=") and not chat_id:
+                            chat_id = line.split("=", 1)[1].strip().strip('"').strip("'")
+            except Exception:
+                pass
     return token, chat_id
 
 def send_batch_questions_to_telegram(
@@ -28,11 +42,12 @@ def send_batch_questions_to_telegram(
 ) -> bool:
     """
     Sends a formatted notification to Telegram when a batch of questions needs answers.
-    Returns True if sent successfully, False otherwise.
+    Security: Never logs or prints the bot token or chat ID.
     """
     token, chat_id = get_telegram_config()
     if not token or not chat_id:
-        print("[Telegram] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not configured in backend/.env. Skipping Telegram message.")
+        # Generic message without revealing paths or credential names
+        print("[Telegram] Bot token or chat ID is not configured. Notification skipped.")
         return False
 
     if not questions:
@@ -88,9 +103,38 @@ def send_batch_questions_to_telegram(
         )
         with urllib.request.urlopen(req, timeout=8) as resp:
             if resp.status == 200:
-                print(f"[Telegram] Batch of {len(questions)} questions sent to Telegram successfully.")
+                print(f"[Telegram] Batch notification for {len(questions)} questions dispatched successfully.")
                 return True
     except Exception as e:
-        print(f"[Telegram] Failed to send message to Telegram: {e}")
+        safe_err = sanitize_log(str(e))
+        print(f"[Telegram] Failed to dispatch message: {safe_err}")
 
     return False
+
+def verify_and_process_telegram_reply(update_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Strict Security: Accepts messages ONLY from the configured chat ID.
+    Rejects any update or webhook from unauthorized senders.
+    """
+    token, configured_chat_id = get_telegram_config()
+    if not token or not configured_chat_id:
+        return None
+
+    message = update_data.get("message") or update_data.get("edited_message")
+    if not message:
+        return None
+
+    incoming_chat_id = str(message.get("chat", {}).get("id") or "")
+    if not incoming_chat_id or incoming_chat_id != str(configured_chat_id):
+        # Reject unauthorized senders immediately
+        print("[Telegram Security] Blocked message from unauthorized chat ID.")
+        return None
+
+    # Authorized sender confirmed
+    text = (message.get("text") or "").strip()
+    return {
+        "authorized": True,
+        "message_id": message.get("message_id"),
+        "text": text,
+        "date": message.get("date")
+    }
