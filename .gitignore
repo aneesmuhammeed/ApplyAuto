@@ -1,0 +1,36 @@
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+*.env
+api_token.txt
+.api_token
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# SQLite databases & local storage
+*.db
+*.sqlite3
+storage/*.db
+storage/*.sqlite3
+storage/resumes/*
+!storage/resumes/.gitkeep
+storage/browser_profile/*
+!storage/browser_profile/.gitkeep
+storage/api_token.txt
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE & OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
