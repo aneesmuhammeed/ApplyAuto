@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import base64
 import asyncio
@@ -9,7 +10,10 @@ from database import (
     get_profile, get_saved_answers, get_applications, get_application,
     update_application, update_worker_heartbeat, create_saved_answer
 )
-from form_filler import fill_form_on_page, detect_security_checkpoint, get_form_context, set_date_on_element
+from form_filler import (
+    fill_form_on_page, detect_security_checkpoint, detect_login_wall,
+    get_form_context, set_date_on_element, fast_restore_form_data
+)
 
 class ApplyMateWorker:
     def __init__(self):
@@ -23,31 +27,51 @@ class ApplyMateWorker:
     async def init_browser(self):
         if not self.playwright:
             self.playwright = await async_playwright().start()
-        if not self.browser:
-            self.browser = await self.playwright.chromium.launch(
-                headless=settings.HEADLESS_BROWSER,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-extensions",
-                    "--no-first-run"
-                ]
-            )
-            user_data_dir = os.path.join(settings.RESUME_STORAGE_DIR, "browser_profile")
+        if not self.context:
+            user_data_dir = os.path.abspath(os.path.join(settings.RESUME_STORAGE_DIR, "browser_profile"))
             os.makedirs(user_data_dir, exist_ok=True)
-            self.context = await self.browser.new_context(viewport={"width": 1280, "height": 800})
-            self.page = await self.context.new_page()
+            try:
+                self.context = await self.playwright.chromium.launch_persistent_context(
+                    user_data_dir=user_data_dir,
+                    headless=settings.HEADLESS_BROWSER,
+                    viewport={"width": 1280, "height": 800},
+                    args=[
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                        "--disable-extensions",
+                        "--no-first-run"
+                    ]
+                )
+                self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
+            except Exception as e:
+                print(f"[Browser Init] Persistent context notice: {e}. Falling back to standard context.")
+                self.browser = await self.playwright.chromium.launch(
+                    headless=settings.HEADLESS_BROWSER,
+                    args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+                )
+                self.context = await self.browser.new_context(viewport={"width": 1280, "height": 800})
+                self.page = await self.context.new_page()
 
     async def close_browser(self):
         if self.context:
-            await self.context.close()
+            try:
+                await self.context.close()
+            except Exception:
+                pass
             self.context = None
+            self.page = None
         if self.browser:
-            await self.browser.close()
+            try:
+                await self.browser.close()
+            except Exception:
+                pass
             self.browser = None
         if self.playwright:
-            await self.playwright.stop()
+            try:
+                await self.playwright.stop()
+            except Exception:
+                pass
             self.playwright = None
 
     async def update_heartbeat(self, status: str = "online", active_app_id: Optional[str] = None):
@@ -86,6 +110,11 @@ class ApplyMateWorker:
         job_url = app["job_url"]
         status = app["status"]
         company_name = app.get("company_name", "")
+        persisted_form_data = app.get("form_data") or {"fields": {}}
+        if not isinstance(persisted_form_data, dict):
+            persisted_form_data = {"fields": {}}
+        if "fields" not in persisted_form_data:
+            persisted_form_data["fields"] = {}
 
         await self.update_heartbeat(status="busy", active_app_id=app_id)
         profile = get_profile()
@@ -94,18 +123,49 @@ class ApplyMateWorker:
 
         await self.init_browser()
 
-        # Step 1: Newly Queued task
-        if status == "queued":
-            await self.log_app(app_id, f"Opening application URL: {job_url}")
-            update_application(app_id, {"status": "processing"})
+        # Check if browser is currently positioned on the target job application page
+        current_url = self.page.url if self.page else ""
+        is_page_open = (
+            current_url 
+            and current_url != "about:blank" 
+            and (job_url.split("?")[0] in current_url or current_url.split("?")[0] in job_url)
+        )
+
+        if not is_page_open:
+            is_recovery = (status in ("needs_input", "processing", "paused") and bool(persisted_form_data.get("fields")))
+            if is_recovery:
+                await self.log_app(app_id, f"[Crash Recovery] Worker resumed. Reconnecting browser to application: {job_url}")
+            else:
+                await self.log_app(app_id, f"Opening application URL: {job_url}")
+
+            if status == "queued":
+                update_application(app_id, {"status": "processing"})
 
             try:
                 await self.page.goto(job_url, timeout=45000, wait_until="domcontentloaded")
                 await asyncio.sleep(2)
-                # Attempt to extract job title/company name from page title if empty
                 page_title = await self.page.title()
                 if page_title and not app.get("job_title"):
                     update_application(app_id, {"job_title": page_title[:80]})
+
+                # Check for initial Login Wall or Security Challenge
+                barrier = await detect_security_checkpoint(self.page) or await detect_login_wall(self.page)
+                if barrier:
+                    screenshot = await self.capture_screenshot()
+                    await self.log_app(app_id, f"Barrier detected: {barrier}")
+                    update_application(app_id, {
+                        "status": "paused",
+                        "stage_message": barrier,
+                        "review_screenshot_url": screenshot
+                    })
+                    return
+
+                # If recovering from crash, fast-restore previously filled fields without refilling!
+                if is_recovery:
+                    ctx = await get_form_context(self.page)
+                    restored_count = await fast_restore_form_data(ctx, persisted_form_data, resume_path=resume_path)
+                    if restored_count > 0:
+                        await self.log_app(app_id, f"[Crash Recovery] Restored {restored_count} previously filled fields from snapshot. Resuming exactly where left off.")
             except Exception as e:
                 await self.log_app(app_id, f"Failed to load job page: {e}")
                 update_application(app_id, {
@@ -155,6 +215,7 @@ class ApplyMateWorker:
                     if el:
                         tag = await el.evaluate("e => e.tagName.toLowerCase()")
                         role = await el.get_attribute("role") or ""
+                        inp_type = (await el.get_attribute("type") or "").lower()
 
                         if tag == "select":
                             # Native select element (including Select2)
@@ -255,16 +316,54 @@ class ApplyMateWorker:
                             else:
                                 await self.page.keyboard.press("ArrowDown")
                                 await self.page.keyboard.press("Enter")
+                        elif inp_type == "radio":
+                            name = await el.get_attribute("name") or ""
+                            from form_filler import get_option_label
+                            group_radios = await ctx.query_selector_all(f'input[type="radio"][name="{name}"]') if name else [el]
+                            for r_el in group_radios:
+                                r_lbl = await get_option_label(ctx, r_el)
+                                if r_lbl.lower() == str(user_answer).lower() or (str(user_answer).lower() == "yes" and r_lbl.lower().startswith("yes")) or (str(user_answer).lower() == "no" and r_lbl.lower().startswith("no")):
+                                    await r_el.click()
+                                    break
+                        elif inp_type == "checkbox":
+                            if str(user_answer).lower() in ["yes", "true", "check", "1"]:
+                                await el.check()
                         elif unanswered.get("type") == "date":
                             # Datepicker or calendar input
                             await set_date_on_element(el, str(user_answer))
+                        elif inp_type == "number":
+                            num_match = re.search(r'\d+(?:\.\d+)?', str(user_answer))
+                            val_num = num_match.group(0) if num_match else "0"
+                            await el.fill(val_num)
+                            await el.evaluate("""(e) => {
+                                e.dispatchEvent(new Event('input', { bubbles: true }));
+                                e.dispatchEvent(new Event('change', { bubbles: true }));
+                            }""")
                         else:
                             # Standard text / textarea input (with date fallback)
                             inp_class = (await el.get_attribute("class") or "").lower()
                             if "datepicker" in inp_class or "calendar" in inp_class:
                                 await set_date_on_element(el, str(user_answer))
                             else:
-                                await el.fill(user_answer)
+                                await el.fill(str(user_answer))
+                                await el.evaluate("""(e) => {
+                                    e.dispatchEvent(new Event('input', { bubbles: true }));
+                                    e.dispatchEvent(new Event('change', { bubbles: true }));
+                                }""")
+
+                        # Record newly answered field in persisted_form_data
+                        ans_key = f"id:{field_id}" if field_id else f"label:{unanswered.get('label', '').lower().strip()}"
+                        persisted_form_data["fields"][ans_key] = {
+                            "key": ans_key,
+                            "id": field_id,
+                            "name": field_id,
+                            "label": unanswered.get("label", ""),
+                            "tag": tag if 'tag' in locals() else "input",
+                            "type": inp_type if 'inp_type' in locals() and inp_type else unanswered.get("type", "text"),
+                            "value": str(user_answer),
+                            "timestamp": time.time()
+                        }
+                        update_application(app_id, {"form_data": persisted_form_data})
                 except Exception as e:
                     print(f"Error filling user answer: {e}")
 
@@ -286,6 +385,7 @@ class ApplyMateWorker:
                                 source="user"
                             )
                             await self.log_app(app_id, f"Saved question to reusable memory: '{lbl_text}'")
+                            saved_answers = get_saved_answers()
                         except Exception as e:
                             print(f"Failed to save reusable answer: {e}")
 
@@ -299,19 +399,28 @@ class ApplyMateWorker:
 
         # Execute autofill pass: scans form, uses local Qwen AI for understanding and answer generation
         await self.log_app(app_id, "Scanning form fields and utilizing local Qwen AI for intelligent autofill...")
-        fill_res = await fill_form_on_page(self.page, profile, saved_answers, resume_path, job_context=company_name)
+        fill_res = await fill_form_on_page(
+            self.page, profile, saved_answers, resume_path,
+            job_context=company_name,
+            existing_form_data=persisted_form_data
+        )
+
+        if "form_data" in fill_res:
+            persisted_form_data = fill_res["form_data"]
+            update_application(app_id, {"form_data": persisted_form_data})
 
         if fill_res["fields_filled"]:
             filled_summary = ", ".join([f"{f['field']}: {f['value']}" for f in fill_res["fields_filled"]])
             await self.log_app(app_id, f"Filled fields: {filled_summary}")
 
         # Check if a visible CAPTCHA or security checkpoint is present
-        if await detect_security_checkpoint(self.page):
+        checkpoint = await detect_security_checkpoint(self.page)
+        if checkpoint:
             screenshot = await self.capture_screenshot()
-            await self.log_app(app_id, "Form fields filled! Visible security CAPTCHA detected. Please solve on laptop.")
+            await self.log_app(app_id, f"Security challenge detected: {checkpoint}")
             update_application(app_id, {
                 "status": "paused",
-                "stage_message": "Fields filled! Please complete the verification on your laptop window, then click Resume.",
+                "stage_message": checkpoint,
                 "review_screenshot_url": screenshot
             })
             return
@@ -327,13 +436,27 @@ class ApplyMateWorker:
                 "unanswered_question": q_info,
                 "ai_suggestion": ai_sug,
                 "review_screenshot_url": screenshot,
-                "stage_message": f"Question needs answer: {q_info['label']}"
+                "stage_message": f"Question needs answer: {q_info['label']}",
+                "form_data": fill_res.get("form_data", persisted_form_data)
             })
             return
 
-        # Handle multi-page form continuation if "Next" button exists
+        # 1. Check if validation errors or unfilled required fields were detected on current step
+        if fill_res.get("validation_errors") or fill_res.get("empty_required_fields"):
+            all_errs = fill_res.get("validation_errors", []) + fill_res.get("empty_required_fields", [])
+            err_msg = "; ".join(all_errs[:3])
+            screenshot = await self.capture_screenshot()
+            await self.log_app(app_id, f"Form validation notice: {err_msg}")
+            update_application(app_id, {
+                "status": "waiting_review",
+                "review_screenshot_url": screenshot,
+                "stage_message": f"Validation notice: {err_msg}. Please review on laptop before submitting."
+            })
+            return
+
+        # 2. Handle multi-step wizard continuation if "Next" button exists and current step is fully valid
         if fill_res["has_next_page"]:
-            await self.log_app(app_id, "Found multi-page form. Navigating to next page...")
+            await self.log_app(app_id, "Step complete! Advancing to next wizard step...")
             try:
                 ctx = await get_form_context(self.page)
                 next_btn = await ctx.query_selector('button:has-text("Next"), input[value="Next"], button:has-text("Next Step"), button:has-text("Save and Continue")')
@@ -341,19 +464,62 @@ class ApplyMateWorker:
                     next_btn = await self.page.query_selector('button:has-text("Next"), input[value="Next"], button:has-text("Next Step"), button:has-text("Save and Continue")')
                 if next_btn and await next_btn.is_visible() and not await next_btn.is_disabled():
                     await next_btn.click(timeout=5000)
+                    try:
+                        await self.page.wait_for_load_state("domcontentloaded", timeout=5000)
+                    except Exception:
+                        pass
                     await asyncio.sleep(2)
+                    await self.log_app(app_id, "New step loaded. Scanning next page fields...")
                     return
             except Exception as e:
                 print(f"Next button click failed: {e}")
 
-        # If all fields filled and ready for review
+        # 3. Final step reached: all wizard pages filled and verified
         screenshot = await self.capture_screenshot()
-        await self.log_app(app_id, "Form successfully filled! Pausing for your final review and explicit approval.")
+        await self.log_app(app_id, "All steps completed! Pausing for your final review and explicit approval.")
         update_application(app_id, {
             "status": "waiting_review",
             "review_screenshot_url": screenshot,
-            "stage_message": "All fields filled. Please review and click 'Approve & Submit' to finalize."
+            "stage_message": "All steps filled. Please review and click 'Approve & Submit' to finalize."
         })
+
+    async def restore_standby_page(self, app: Dict[str, Any]):
+        """
+        Crash Recovery Standby:
+        If worker restarted while a task was waiting for user input,
+        proactively re-opens the browser at the application URL, restores
+        all previously filled fields from snapshot, and scrolls to the pending question.
+        """
+        app_id = app["id"]
+        job_url = app["job_url"]
+        persisted_form_data = app.get("form_data") or {"fields": {}}
+        if not isinstance(persisted_form_data, dict):
+            persisted_form_data = {"fields": {}}
+        profile = get_profile()
+        resume_path = profile.get("resume_file_path")
+        unanswered = app.get("unanswered_question") or {}
+
+        try:
+            await self.init_browser()
+            current_url = self.page.url if self.page else ""
+            if not current_url or current_url == "about:blank" or (job_url.split("?")[0] not in current_url and current_url.split("?")[0] not in job_url):
+                await self.log_app(app_id, f"[Crash Recovery] Proactively restoring browser session at waiting question...")
+                await self.page.goto(job_url, timeout=45000, wait_until="domcontentloaded")
+                await asyncio.sleep(2)
+                ctx = await get_form_context(self.page)
+                restored = await fast_restore_form_data(ctx, persisted_form_data, resume_path=resume_path)
+                if restored > 0:
+                    await self.log_app(app_id, f"[Crash Recovery] Standby session ready with {restored} fields restored. Waiting for your reply...")
+                field_id = unanswered.get("field_id")
+                if field_id:
+                    try:
+                        el = await ctx.query_selector(f"#{field_id}") or await ctx.query_selector(f'[name="{field_id}"]')
+                        if el:
+                            await el.scroll_into_view_if_needed()
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[Crash Recovery Standby] Error restoring standby page: {e}")
 
     async def submit_application(self, app: Dict[str, Any]):
         app_id = app["id"]
@@ -420,6 +586,12 @@ class ApplyMateWorker:
                     await self.process_task(queued_tasks[0])
                     await asyncio.sleep(settings.POLL_INTERVAL)
                     continue
+
+                # 4. Proactive crash-recovery standby for pending needs_input tasks
+                waiting_input_tasks = [a for a in apps if a["status"] == "needs_input" and not a.get("user_answer")]
+                if waiting_input_tasks and (not self.page or self.page.url == "about:blank"):
+                    wait_app = waiting_input_tasks[0]
+                    await self.restore_standby_page(wait_app)
 
             except Exception as e:
                 print(f"[Worker Exception] {e}")

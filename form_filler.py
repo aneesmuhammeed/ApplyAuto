@@ -1,17 +1,31 @@
 import os
 import re
+import time
 import asyncio
 from typing import Dict, Any, List, Optional
 from playwright.async_api import Page, Frame, ElementHandle
 from field_rules import get_field_match_by_rules
 from ai_client import ai_interpret_field, ai_match_saved_answers, ai_generate_tailored_answer
 
-async def detect_security_checkpoint(page: Page) -> bool:
+async def detect_security_checkpoint(page: Page) -> Optional[str]:
     """
-    Check if an active, blocking CAPTCHA challenge or verification modal is actually blocking the page.
-    Filters out background reCAPTCHA badge iframes and invisible tokens.
+    Check if an active, blocking CAPTCHA challenge or bot verification is blocking the page:
+    1. Interactive Cloudflare Turnstile / challenge-running
+    2. Active reCAPTCHA / hCaptcha challenge frames
+    3. Arkose Labs / Datadome / PerimeterX modals
+    4. Text headings ("Verify you are human", "Security Check")
+    Returns a description of the barrier if found, or None.
     """
     try:
+        # 1. Cloudflare Turnstile & Challenge platform
+        cf_blocks = await page.query_selector_all(
+            '#cf-challenge-running, #challenge-stage, .cf-turnstile-wrapper, iframe[src*="challenges.cloudflare.com"]'
+        )
+        for cf in cf_blocks:
+            if await cf.is_visible():
+                return "Cloudflare Bot Verification detected. Please solve the challenge on your laptop window, then click Resume."
+
+        # 2. Active reCAPTCHA / hCaptcha challenge frames
         captcha_frames = await page.query_selector_all(
             'iframe[src*="recaptcha/enterprise/bframe"], iframe[src*="recaptcha/api2/bframe"], iframe[src*="hcaptcha.com/box"]'
         )
@@ -19,20 +33,55 @@ async def detect_security_checkpoint(page: Page) -> bool:
             if await frame.is_visible():
                 box = await frame.bounding_box()
                 if box and box["width"] > 200 and box["height"] > 200:
-                    return True
+                    return "Security CAPTCHA challenge detected. Please complete on your laptop window, then click Resume."
 
+        # 3. Arkose Labs / Datadome / PerimeterX
+        bot_frames = await page.query_selector_all(
+            'iframe[src*="arkoselabs"], iframe[src*="datadome"], iframe[src*="perimeterx"], #px-captcha, [id*="dd-captcha"]'
+        )
+        for frame in bot_frames:
+            if await frame.is_visible():
+                return "Anti-Bot Verification challenge detected. Please solve on your laptop window, then click Resume."
+
+        # 4. Visible heading text blocks
         visible_blocks = await page.query_selector_all(
-            'h1, h2, h3, .challenge-container, #cf-challenge-running, [id*="captcha"]'
+            'h1, h2, h3, .challenge-container, [id*="captcha"]'
         )
         for el in visible_blocks:
             if await el.is_visible():
                 txt = (await el.inner_text() or "").lower()
-                if any(w in txt for w in ["verify you are human", "enter the verification code", "one-time password", "security check"]):
-                    return True
+                if any(w in txt for w in ["verify you are human", "enter the verification code", "one-time password", "security check", "suspicious activity"]):
+                    return "Security verification detected. Please complete on your laptop window, then click Resume."
     except Exception:
         pass
 
-    return False
+    return None
+
+async def detect_login_wall(page: Page) -> Optional[str]:
+    """
+    Detect if the job portal is gated behind a mandatory authentication wall
+    (Workday, Taleo, LinkedIn, custom candidate logins).
+    """
+    try:
+        url = page.url.lower()
+        if any(w in url for w in ["/login", "/signin", "/auth/login", "/candidates/login", "/myworkday"]):
+            pw = await page.query_selector('input[type="password"]')
+            if pw and await pw.is_visible():
+                return "Candidate Login Required. Please sign in on the open browser window, then click Resume."
+
+        # Check for visible login headings
+        login_headings = await page.query_selector_all('h1, h2, h3, .login-title, [class*="login"]')
+        for el in login_headings:
+            if await el.is_visible():
+                txt = (await el.inner_text() or "").lower()
+                if any(w in txt for w in ["sign in to apply", "log in to your account", "candidate sign in", "create an account to apply", "please log in to continue"]):
+                    pw = await page.query_selector('input[type="password"]')
+                    if pw and await pw.is_visible():
+                        return "Candidate Login Required. Please sign in on the open browser window, then click Resume."
+    except Exception:
+        pass
+
+    return None
 
 async def get_form_context(page: Page):
     """
@@ -122,20 +171,40 @@ async def set_date_on_element(el: ElementHandle, date_str: str) -> bool:
                 } catch(err) {}
             }
 
-            // 3. Fallback: remove readonly, format value based on element hints, and dispatch events
+            // 3. Bootstrap Datepicker
+            if (window.jQuery && window.jQuery(e).data('bs.datepicker')) {
+                try {
+                    window.jQuery(e).datepicker('update', d);
+                    e.dispatchEvent(new Event('change', { bubbles: true }));
+                    return;
+                } catch(err) {}
+            }
+
+            // 4. Fallback: remove readonly, format value based on element hints, and dispatch events with React setter
             e.removeAttribute('readonly');
             let months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
             let mName = months[d.getMonth()];
             let yr = d.getFullYear();
             let day = ('0' + d.getDate()).slice(-2);
+            let mo = ('0' + (d.getMonth() + 1)).slice(-2);
 
             let ph = (e.placeholder || '').toLowerCase();
+            let formattedVal = `${day}/${mo}/${yr}`;
             if (ph.includes('june') || ph.includes('month') || ph.includes('yy')) {
-                e.value = `${mName} ${yr}`;
+                formattedVal = `${mName} ${yr}`;
             } else if (e.type === 'date') {
-                e.value = `${yr}-${('0' + (d.getMonth() + 1)).slice(-2)}-${day}`;
+                formattedVal = `${yr}-${mo}-${day}`;
+            } else if (ph.includes('mm/dd') || ph.includes('mm-dd')) {
+                formattedVal = `${mo}/${day}/${yr}`;
             } else {
-                e.value = `${day}/${('0' + (d.getMonth() + 1)).slice(-2)}/${yr}`;
+                formattedVal = `${day}/${mo}/${yr}`;
+            }
+
+            try {
+                let nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+                nativeSetter.call(e, formattedVal);
+            } catch(err) {
+                e.value = formattedVal;
             }
 
             e.dispatchEvent(new Event('input', { bubbles: true }));
@@ -146,19 +215,141 @@ async def set_date_on_element(el: ElementHandle, date_str: str) -> bool:
         print(f"Error setting date on element: {e}")
         return False
 
+async def get_group_question(ctx, el: ElementHandle) -> str:
+    """
+    Exclusively resolves the overall question for radio groups and multi-checkbox groups:
+    1. fieldset > legend (W3C standard)
+    2. Question container headers (.field__label, .question-title, etc.)
+    3. Label elements that do NOT wrap the radio/checkbox options
+    4. Nearby preceding text / sibling headings
+    5. aria-labelledby on the fieldset/container
+    """
+    try:
+        # 1. Check fieldset > legend (W3C standard)
+        fieldset = await el.query_selector("xpath=ancestor::fieldset")
+        if fieldset:
+            legend = await fieldset.query_selector("legend")
+            if legend:
+                txt = (await legend.inner_text() or "").strip()
+                if txt and not any(skip in txt.lower() for skip in ["select...", "error"]):
+                    return txt.rstrip("*").strip()
+
+        # 2. Check question container (field / question / form-group)
+        container = await el.query_selector("xpath=ancestor::div[contains(@class, 'field') or contains(@class, 'question') or contains(@class, 'form-group') or contains(@class, 'application-question') or contains(@class, 'form-item') or contains(@class, 'radio-group') or contains(@class, 'checkbox-group')]")
+        if container:
+            # Query header/label inside container (excluding option labels)
+            lbl = await container.query_selector(".field__label, .field-label, .question-header, .question-title, .label, [class*='label']:not([class*='option']):not([class*='choice']), legend, h3, h4, p[class*='title'], p[class*='label'], strong")
+            if lbl:
+                txt = (await lbl.inner_text() or "").strip()
+                if txt and not any(skip in txt.lower() for skip in ["select...", "error"]):
+                    return txt.rstrip("*").strip()
+
+            # Query label that does NOT wrap an input
+            lbl2 = await container.query_selector("label:not(:has(input))")
+            if lbl2:
+                txt = (await lbl2.inner_text() or "").strip()
+                if txt and not any(skip in txt.lower() for skip in ["select...", "error"]):
+                    return txt.rstrip("*").strip()
+
+        # 3. Check aria-labelledby on el
+        aria_labelledby = await el.get_attribute("aria-labelledby")
+        if aria_labelledby:
+            parts = []
+            for lid in aria_labelledby.split():
+                lbl_target = await ctx.query_selector(f'#{lid}')
+                if lbl_target:
+                    txt = (await lbl_target.inner_text() or "").strip()
+                    if txt and not any(skip in txt.lower() for skip in ["error", "required"]):
+                        parts.append(txt)
+            if parts:
+                return " ".join(parts).rstrip("*").strip()
+
+        # 4. Check preceding sibling element (nearby text)
+        prec = await el.query_selector("xpath=preceding-sibling::*[self::label or self::span or self::p or self::div or self::h4 or self::h3][1]")
+        if prec:
+            txt = (await prec.inner_text() or "").strip()
+            if txt and len(txt) < 150 and not any(skip in txt.lower() for skip in ["error", "select..."]):
+                return txt.rstrip("*").strip()
+
+        # 5. Clean name attribute
+        name = await el.get_attribute("name")
+        if name and name.strip():
+            clean_name = re.sub(r'\[.*?\]|[_\-\.]', ' ', name).strip().title()
+            if clean_name and len(clean_name) > 3 and not clean_name.isdigit():
+                return clean_name
+    except Exception:
+        pass
+    return ""
+
+async def get_option_label(ctx, el: ElementHandle) -> str:
+    """
+    Resolves the specific choice label for an individual radio or checkbox button:
+    1. Wrapping ancestor <label>
+    2. Matching <label for="...">
+    3. Next sibling <span> or text
+    4. HTML value attribute
+    """
+    try:
+        # 1. Wrapping ancestor label
+        parent_lbl = await el.query_selector("xpath=ancestor::label")
+        if parent_lbl:
+            txt = (await parent_lbl.inner_text() or "").strip()
+            if txt:
+                return txt.rstrip("*").strip()
+
+        # 2. Matching <label for="...">
+        el_id = await el.get_attribute("id")
+        if el_id:
+            lbl = await ctx.query_selector(f'label[for="{el_id}"]')
+            if lbl:
+                txt = (await lbl.inner_text() or "").strip()
+                if txt:
+                    return txt.rstrip("*").strip()
+
+        # 3. Next sibling span/label text
+        txt = await el.evaluate("""(e) => {
+            if (e.nextElementSibling && (e.nextElementSibling.tagName === 'SPAN' || e.nextElementSibling.tagName === 'LABEL')) {
+                return e.nextElementSibling.innerText.trim();
+            }
+            if (e.parentElement) {
+                let clone = e.parentElement.cloneNode(true);
+                let inputs = clone.querySelectorAll('input');
+                inputs.forEach(i => i.remove());
+                return clone.innerText.trim();
+            }
+            return e.value || '';
+        }""")
+        if txt and txt.strip():
+            return txt.strip().rstrip("*").strip()
+
+        # 4. Fallback to value attribute
+        val = await el.get_attribute("value")
+        if val and val.strip() and val.strip() not in ["on", "1", "true"]:
+            return val.strip()
+    except Exception:
+        pass
+    return ""
+
 async def get_element_label(ctx, el: ElementHandle) -> str:
     """
     Comprehensive label resolver supporting:
-    1. aria-labelledby (resolves multiple IDs)
-    2. aria-label
-    3. <label for="id">
-    4. Wrapping ancestor <label>
-    5. fieldset > legend (crucial for radio & checkbox groups)
+    1. Radio group question delegation (fieldset/legend or container header)
+    2. aria-labelledby (resolves multiple IDs)
+    3. aria-label
+    4. <label for="id">
+    5. Wrapping ancestor <label>
     6. Form-group / question container headers (.field-label, .question-title, etc.)
-    7. Placeholder
-    8. Preceding sibling or name attribute
+    7. Nearby preceding sibling element (label, span, div, p)
+    8. Placeholder
+    9. Preceding sibling or name attribute
     """
     try:
+        inp_type = (await el.get_attribute("type") or "").lower()
+        if inp_type == "radio":
+            group_q = await get_group_question(ctx, el)
+            if group_q:
+                return group_q
+
         # 1. Check aria-labelledby
         aria_labelledby = await el.get_attribute("aria-labelledby")
         if aria_labelledby:
@@ -186,30 +377,29 @@ async def get_element_label(ctx, el: ElementHandle) -> str:
                 if txt:
                     return txt.rstrip("*").strip()
 
-        # 4. Check wrapping ancestor label
-        parent_lbl = await el.query_selector("xpath=ancestor::label")
-        if parent_lbl:
-            txt = (await parent_lbl.inner_text() or "").strip()
-            if txt:
-                return txt.rstrip("*").strip()
-
-        # 5. Check fieldset > legend (for radio and checkbox groups)
-        fieldset = await el.query_selector("xpath=ancestor::fieldset")
-        if fieldset:
-            legend = await fieldset.query_selector("legend")
-            if legend:
-                txt = (await legend.inner_text() or "").strip()
+        # 4. Check wrapping ancestor label (if not radio)
+        if inp_type != "radio":
+            parent_lbl = await el.query_selector("xpath=ancestor::label")
+            if parent_lbl:
+                txt = (await parent_lbl.inner_text() or "").strip()
                 if txt:
                     return txt.rstrip("*").strip()
 
-        # 6. Check question container header or label
-        container = await el.query_selector("xpath=ancestor::div[contains(@class, 'field') or contains(@class, 'form-group') or contains(@class, 'question') or contains(@class, 'select__container')]")
+        # 5. Check question container header or label
+        container = await el.query_selector("xpath=ancestor::div[contains(@class, 'field') or contains(@class, 'form-group') or contains(@class, 'question') or contains(@class, 'select__container') or contains(@class, 'form-item')]")
         if container:
             lbl = await container.query_selector("label, legend, .label, [class*='label'], [class*='title'], [class*='header']")
             if lbl:
                 txt = (await lbl.inner_text() or "").strip()
                 if txt and not any(skip in txt.lower() for skip in ["select...", "error"]):
                     return txt.rstrip("*").strip()
+
+        # 6. Check nearby preceding sibling element
+        prec = await el.query_selector("xpath=preceding-sibling::*[self::label or self::span or self::p or self::div][1]")
+        if prec:
+            txt = (await prec.inner_text() or "").strip()
+            if txt and len(txt) < 150 and not any(skip in txt.lower() for skip in ["select...", "error"]):
+                return txt.rstrip("*").strip()
 
         # 7. Check placeholder
         placeholder = await el.get_attribute("placeholder")
@@ -219,7 +409,7 @@ async def get_element_label(ctx, el: ElementHandle) -> str:
         # 8. Check name attribute
         name = await el.get_attribute("name")
         if name and name.strip():
-            clean_name = re.sub(r'[_\-\[\]]', ' ', name).strip().title()
+            clean_name = re.sub(r'[_\-\[\]\.]', ' ', name).strip().title()
             return clean_name
     except Exception:
         pass
@@ -263,39 +453,288 @@ async def map_intent_to_profile(intent: str, profile: Dict[str, Any]) -> Optiona
     return mapping.get(intent)
 
 def is_sensitive_question(label: str) -> bool:
-    """Detect whether a question involves sensitive compliance, legal, or compensation terms."""
+    """
+    Detect whether a question involves sensitive compliance, legal, compensation,
+    or quantitative qualification terms (salary, years of experience, sponsorship).
+    These fields must NEVER be invented by AI — they must come strictly from the
+    resume profile or previously approved saved answers, or pause for user input.
+    """
     lbl = label.lower()
     sensitive_keywords = [
-        "salary", "compensation", "pay", "rate",
-        "visa", "sponsorship", "authorized to work", "work authorization", "citizenship",
+        "salary", "compensation", "pay", "rate", "ctc", "expected", "remuneration",
+        "years of experience", "years experience", "how many years", "experience with",
+        "notice period", "how soon", "available to join",
+        "gpa", "cgpa", "grade", "percentage",
+        "visa", "sponsorship", "authorized to work", "work authorization", "citizenship", "alien",
         "disability", "veteran", "gender", "race", "ethnicity", "sexual orientation",
         "criminal", "felony", "misdemeanor", "background check", "drug test",
+        "security clearance", "secret clearance",
         "consent", "agreement", "acknowledge"
     ]
     return any(k in lbl for k in sensitive_keywords)
 
-async def check_validation_errors(ctx) -> List[str]:
-    """Check for active validation error messages on the page after filling."""
-    errors = []
+async def verify_form_completion_and_errors(ctx) -> Dict[str, Any]:
+    """
+    Exhaustively re-reads every interactive element in the form:
+    1. Checks if any required field is empty or unselected.
+    2. Checks for aria-invalid or visible error text nodes.
+    3. Checks for form-level error banners and alerts.
+    """
+    empty_required = []
+    validation_errors = []
+
+    # 1. Scan for visible error messages
+    error_selectors = [
+        '[aria-invalid="true"]',
+        '.error-message', '.field-error', '.help-block-error', '.invalid-feedback',
+        '[class*="errorMessage"]', '[class*="error-text"]', '[class*="field-error"]',
+        '[role="alert"]', '.alert-danger', '.form-error'
+    ]
     try:
-        error_els = await ctx.query_selector_all(
-            '[aria-invalid="true"], .error-message, .field-error, .help-block-error, [class*="errorMessage"], [class*="error-text"]'
-        )
+        error_els = await ctx.query_selector_all(", ".join(error_selectors))
         for el in error_els:
             if await el.is_visible():
                 txt = (await el.inner_text() or "").strip()
-                if txt and txt not in errors:
-                    errors.append(txt)
+                if txt and len(txt) < 200 and txt not in validation_errors:
+                    if not any(skip in txt.lower() for skip in ["cookie", "privacy policy", "all rights reserved"]):
+                        validation_errors.append(txt)
     except Exception:
         pass
-    return errors
+
+    # 2. Re-read all form fields to verify required fields are actually populated
+    try:
+        elements = await ctx.query_selector_all('input, select, textarea, [role="combobox"]')
+        checked_radio_groups = set()
+
+        for el in elements:
+            inp_type = (await el.get_attribute("type") or "").lower()
+            tag = await el.evaluate("e => e.tagName.toLowerCase()")
+            if inp_type in ["submit", "button", "reset", "hidden"]:
+                continue
+            if not await el.is_visible() and inp_type != "file" and tag != "select":
+                continue
+
+            # Determine if element is required
+            is_req = False
+            if await el.get_attribute("required") is not None or await el.get_attribute("aria-required") == "true":
+                is_req = True
+            
+            label = await get_element_label(ctx, el)
+            if "*" in label or "required" in (await el.get_attribute("class") or "").lower():
+                is_req = True
+
+            parent = await el.query_selector("xpath=ancestor::div[contains(@class, 'field') or contains(@class, 'form-group') or contains(@class, 'question')][1]")
+            if parent:
+                parent_html = (await parent.inner_html() or "").lower()
+                if 'class="asterisk"' in parent_html or 'class="required"' in parent_html or "aria-required" in parent_html:
+                    is_req = True
+
+            if not is_req:
+                continue
+
+            field_name = label or await el.get_attribute("name") or "Required Field"
+            if inp_type == "radio":
+                name = await el.get_attribute("name") or ""
+                if name in checked_radio_groups:
+                    continue
+                checked_radio_groups.add(name)
+                group_radios = await ctx.query_selector_all(f'input[type="radio"][name="{name}"]') if name else [el]
+                if not any([await r.is_checked() for r in group_radios]):
+                    empty_required.append(f"{field_name} (Radio group unselected)")
+
+            elif inp_type == "checkbox":
+                if not await el.is_checked():
+                    empty_required.append(f"{field_name} (Checkbox unchecked)")
+
+            elif tag == "select":
+                val = await el.evaluate("s => s.options[s.selectedIndex] ? s.options[s.selectedIndex].text.trim() : ''")
+                if not val or val.lower() in ["select", "select an option", "select...", "-- select --", "choose"]:
+                    empty_required.append(f"{field_name} (Dropdown unselected)")
+
+            elif tag in ["input", "textarea"]:
+                val = await el.input_value()
+                if not val or not val.strip():
+                    empty_required.append(f"{field_name} (Empty)")
+
+    except Exception as e:
+        print(f"Error re-reading required fields: {e}")
+
+    return {
+        "validation_errors": validation_errors,
+        "empty_required_fields": empty_required,
+        "is_valid": len(validation_errors) == 0 and len(empty_required) == 0
+    }
+
+async def fast_restore_form_data(
+    ctx,
+    form_data: Dict[str, Any],
+    resume_path: Optional[str] = None
+) -> int:
+    """
+    Crash Recovery Engine:
+    Fast-restores previously filled fields directly into the active form DOM
+    without calling any LLM / AI models.
+    Returns the number of restored fields.
+    """
+    if not form_data or not isinstance(form_data, dict):
+        return 0
+    
+    fields = form_data.get("fields", {})
+    if not fields or not isinstance(fields, dict):
+        return 0
+
+    restored_count = 0
+
+    for key, f in fields.items():
+        try:
+            val = f.get("value")
+            if val is None or str(val).strip() == "":
+                continue
+
+            f_id = f.get("id")
+            f_name = f.get("name")
+            f_label = f.get("label", "")
+            f_type = f.get("type", "text")
+            f_tag = f.get("tag", "input")
+            f_selector = f.get("selector", "")
+
+            el = None
+            if f_selector:
+                try:
+                    el = await ctx.query_selector(f_selector)
+                except Exception:
+                    el = None
+
+            if not el and f_id:
+                try:
+                    el = await ctx.query_selector(f"#{f_id}")
+                except Exception:
+                    el = None
+
+            if not el and f_name:
+                try:
+                    el = await ctx.query_selector(f'[name="{f_name}"]')
+                except Exception:
+                    el = None
+
+            if not el and f_label:
+                try:
+                    safe_lbl = f_label.replace('"', '\\"')
+                    lbl_el = await ctx.query_selector(f'label:has-text("{safe_lbl}")')
+                    if lbl_el:
+                        for_attr = await lbl_el.get_attribute("for")
+                        if for_attr:
+                            el = await ctx.query_selector(f"#{for_attr}")
+                except Exception:
+                    el = None
+
+            if not el:
+                continue
+
+            # Restore based on field type
+            if f_type == "file":
+                has_files = await el.evaluate("e => e.files && e.files.length > 0")
+                target_file = val if (val and os.path.exists(str(val))) else resume_path
+                if not has_files and target_file and os.path.exists(target_file):
+                    await el.set_input_files(target_file)
+                    await el.evaluate("""e => {
+                        e.dispatchEvent(new Event('input', { bubbles: true }));
+                        e.dispatchEvent(new Event('change', { bubbles: true }));
+                    }""")
+                    restored_count += 1
+
+            elif f_tag == "select" or f_type == "select":
+                cur_val = await el.evaluate("e => e.value || (e.options && e.selectedIndex >= 0 ? e.options[e.selectedIndex].text : '')")
+                if not cur_val or cur_val.strip() in ["", "0", "-1", "Select", "Select..."]:
+                    await el.evaluate("""(sel, target) => {
+                        let tLow = String(target).toLowerCase().trim();
+                        for (let o of sel.options) {
+                            let oText = o.text.toLowerCase().trim();
+                            let oVal = o.value.toLowerCase().trim();
+                            if (oText === tLow || oVal === tLow || oText.includes(tLow) || tLow.includes(oText)) {
+                                sel.value = o.value;
+                                sel.dispatchEvent(new Event('change', { bubbles: true }));
+                                if (window.jQuery && window.jQuery(sel).data('select2')) {
+                                    window.jQuery(sel).val(o.value).trigger('change');
+                                }
+                                break;
+                            }
+                        }
+                    }""", str(val))
+                    restored_count += 1
+
+            elif f_type == "combobox":
+                parent_container = await el.query_selector("xpath=ancestor::div[contains(@class, 'select')]")
+                val_container = await parent_container.query_selector("[class*='singleValue'], [class*='single-value'], .select2-selection__rendered") if parent_container else None
+                curr_txt = (await val_container.inner_text() or "").strip() if val_container else ""
+                if not curr_txt or curr_txt in ["Select...", "", "Select", "Select an option"]:
+                    control = await parent_container.query_selector(".select__control") if parent_container else None
+                    if control:
+                        await control.click()
+                        await asyncio.sleep(0.3)
+                    opt_match = await ctx.query_selector(f'.select__option:has-text("{val}")')
+                    if opt_match:
+                        await opt_match.click()
+                        restored_count += 1
+                    else:
+                        await el.fill(str(val))
+                        await asyncio.sleep(0.5)
+                        await el.press("Enter")
+                        restored_count += 1
+
+            elif f_type == "radio":
+                is_checked = await el.is_checked()
+                if not is_checked:
+                    name_attr = await el.get_attribute("name") or f_name
+                    group_radios = await ctx.query_selector_all(f'input[type="radio"][name="{name_attr}"]') if name_attr else [el]
+                    for r_el in group_radios:
+                        r_lbl = await get_option_label(ctx, r_el)
+                        if (r_lbl.lower() == str(val).lower() or 
+                            (str(val).lower() == "yes" and r_lbl.lower().startswith("yes")) or 
+                            (str(val).lower() == "no" and r_lbl.lower().startswith("no"))):
+                            await r_el.click()
+                            restored_count += 1
+                            break
+
+            elif f_type == "checkbox":
+                is_checked = await el.is_checked()
+                if not is_checked and str(val).lower() in ["yes", "true", "1", "check", "checked"]:
+                    await el.check()
+                    restored_count += 1
+
+            elif f_type == "date":
+                cur_val = await el.input_value()
+                if not cur_val or cur_val.strip() != str(val).strip():
+                    await set_date_on_element(el, str(val))
+                    restored_count += 1
+
+            else:
+                cur_val = await el.input_value()
+                if not cur_val or cur_val.strip() != str(val).strip():
+                    if f_type == "number":
+                        num_match = re.search(r'\d+(?:\.\d+)?', str(val))
+                        v_num = num_match.group(0) if num_match else "0"
+                        await el.fill(v_num)
+                    else:
+                        await el.fill(str(val))
+                    await el.evaluate("""e => {
+                        e.dispatchEvent(new Event('input', { bubbles: true }));
+                        e.dispatchEvent(new Event('change', { bubbles: true }));
+                    }""")
+                    restored_count += 1
+
+        except Exception as e:
+            print(f"[Crash Recovery] Error restoring field '{key}': {e}")
+
+    return restored_count
 
 async def fill_form_on_page(
     page: Page,
     profile: Dict[str, Any],
     saved_answers: List[Dict[str, Any]],
     resume_path: Optional[str] = None,
-    job_context: str = ""
+    job_context: str = "",
+    existing_form_data: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
     Intelligent Form Automation Engine (Sequential Top-to-Bottom Scraper):
@@ -310,6 +749,24 @@ async def fill_form_on_page(
     """
     ctx = await get_form_context(page)
 
+    form_data = existing_form_data.copy() if (existing_form_data and isinstance(existing_form_data, dict)) else {"fields": {}, "current_step": 1}
+    if "fields" not in form_data or not isinstance(form_data["fields"], dict):
+        form_data["fields"] = {}
+
+    def record_filled(k_id, k_name, k_label, k_tag, k_type, k_val, selector=""):
+        key = f"id:{k_id}" if k_id else (f"name:{k_name}" if k_name else f"label:{k_label.lower().strip()}")
+        form_data["fields"][key] = {
+            "key": key,
+            "id": k_id,
+            "name": k_name,
+            "label": k_label,
+            "tag": k_tag,
+            "type": k_type,
+            "value": str(k_val),
+            "selector": selector,
+            "timestamp": time.time()
+        }
+
     result = {
         "completed": True,
         "needs_input": False,
@@ -318,7 +775,8 @@ async def fill_form_on_page(
         "fields_filled": [],
         "has_next_page": False,
         "submit_button_found": False,
-        "validation_errors": []
+        "validation_errors": [],
+        "form_data": form_data
     }
 
     # Query all interactive form controls in natural top-to-bottom DOM order
@@ -377,8 +835,26 @@ async def fill_form_on_page(
             if inp_type == "file":
                 if resume_path and os.path.exists(resume_path):
                     try:
+                        lbl_low = (label or "").lower()
+                        el_id_low = el_id.lower()
+                        name_low = name.lower()
+                        is_cover_letter = any(w in lbl_low or w in el_id_low or w in name_low for w in ["cover", "letter"])
+
+                        # If field is specifically for an optional cover letter, don't duplicate resume
+                        if is_cover_letter:
+                            is_required = await el.get_attribute("required") is not None or await el.get_attribute("aria-required") == "true"
+                            if not is_required:
+                                continue
+
+                        # Attach the file directly into hidden or styled input[type="file"] via CDP
                         await el.set_input_files(resume_path)
+                        # Dispatch events so React/Vue/Angular state updates immediately
+                        await el.evaluate("""(e) => {
+                            e.dispatchEvent(new Event('input', { bubbles: true }));
+                            e.dispatchEvent(new Event('change', { bubbles: true }));
+                        }""")
                         result["fields_filled"].append({"field": label or "Resume Upload", "value": os.path.basename(resume_path)})
+                        record_filled(el_id, name, label or "Resume Upload", tag, "file", resume_path, selector=f"#{el_id}" if el_id else "")
                     except Exception as e:
                         print(f"File upload error on '{label}': {e}")
                 continue
@@ -412,6 +888,7 @@ async def fill_form_on_page(
                         if opt_match:
                             await opt_match.click()
                             result["fields_filled"].append({"field": label, "value": country_val})
+                            record_filled(el_id, name, label, tag, "combobox", country_val)
                             await asyncio.sleep(0.8)
                             continue
 
@@ -437,19 +914,21 @@ async def fill_form_on_page(
                             matched_text = (await opt_match.inner_text() or "").strip()
                             await opt_match.click()
                             result["fields_filled"].append({"field": label, "value": matched_text or loc_val})
+                            record_filled(el_id, name, label, tag, "combobox", matched_text or loc_val)
                         else:
                             await page.keyboard.press("ArrowDown")
                             await page.keyboard.press("Enter")
                             result["fields_filled"].append({"field": label, "value": loc_val})
+                            record_filled(el_id, name, label, tag, "combobox", loc_val)
                         await asyncio.sleep(0.4)
                         continue
                     except Exception as e:
                         print(f"Error autofilling location combobox: {e}")
 
-                # C. Check deterministic rules & saved answers
-                matched_val = get_field_match_by_rules(label, profile)
-                if not matched_val:
-                    matched_val = await ai_match_saved_answers(label, saved_answers, company_name=job_context)
+                # C. Check saved answers (memory) and non-sensitive deterministic rules
+                matched_val = await ai_match_saved_answers(label, saved_answers, company_name=job_context)
+                if not matched_val and not is_sensitive_question(label):
+                    matched_val = get_field_match_by_rules(label, profile)
 
                 # D. Open dropdown popup & extract options
                 options = []
@@ -520,6 +999,7 @@ async def fill_form_on_page(
                         await opt_match.click()
                         await asyncio.sleep(0.3)
                         result["fields_filled"].append({"field": label, "value": str(matched_val)})
+                        record_filled(el_id, name, label, tag, "combobox", str(matched_val))
                         continue
                     else:
                         # Virtualized list handling: type into combobox to filter DOM, or scroll popup
@@ -536,6 +1016,7 @@ async def fill_form_on_page(
                                 await opt_match.click()
                                 await asyncio.sleep(0.3)
                                 result["fields_filled"].append({"field": label, "value": str(matched_val)})
+                                record_filled(el_id, name, label, tag, "combobox", str(matched_val))
                                 continue
 
                             # If still not found, scroll virtualized list container
@@ -548,6 +1029,7 @@ async def fill_form_on_page(
                                         await opt_match.click()
                                         await asyncio.sleep(0.3)
                                         result["fields_filled"].append({"field": label, "value": str(matched_val)})
+                                        record_filled(el_id, name, label, tag, "combobox", str(matched_val))
                                         break
                                 if opt_match:
                                     continue
@@ -557,6 +1039,7 @@ async def fill_form_on_page(
                             await page.keyboard.press("Enter")
                             await asyncio.sleep(0.3)
                             result["fields_filled"].append({"field": label, "value": str(matched_val)})
+                            record_filled(el_id, name, label, tag, "combobox", str(matched_val))
                             continue
                         except Exception as e:
                             print(f"Error selecting virtualized option for {label}: {e}")
@@ -644,6 +1127,7 @@ async def fill_form_on_page(
                         }
                     }""")
                     result["fields_filled"].append({"field": label or "Country Code", "value": "+91"})
+                    record_filled(el_id, name, label or "Country Code", tag, "select", "+91")
                     continue
 
                 # B. Currency
@@ -666,12 +1150,13 @@ async def fill_form_on_page(
                         }
                     }""")
                     result["fields_filled"].append({"field": label or "Currency", "value": "INR"})
+                    record_filled(el_id, name, label or "Currency", tag, "select", "INR")
                     continue
 
-                # C. Rules & Reusable Memory match
-                matched_val = get_field_match_by_rules(label, profile)
-                if not matched_val and opt_texts:
-                    matched_val = await ai_match_saved_answers(label, saved_answers, company_name=job_context)
+                # C. Check saved answers (memory) and non-sensitive deterministic rules
+                matched_val = await ai_match_saved_answers(label, saved_answers, company_name=job_context)
+                if not matched_val and not is_sensitive_question(label):
+                    matched_val = get_field_match_by_rules(label, profile)
 
                 if matched_val:
                     m_lower = str(matched_val).strip().lower()
@@ -704,11 +1189,13 @@ async def fill_form_on_page(
 
                     if applied:
                         result["fields_filled"].append({"field": label, "value": str(matched_val)})
+                        record_filled(el_id, name, label, tag, "select", str(matched_val))
                         continue
                     else:
                         try:
                             await el.select_option(label=str(matched_val), timeout=2000)
                             result["fields_filled"].append({"field": label, "value": str(matched_val)})
+                            record_filled(el_id, name, label, tag, "select", str(matched_val))
                             continue
                         except Exception:
                             pass
@@ -735,11 +1222,12 @@ async def fill_form_on_page(
             # 4. RADIO BUTTON GROUPS
             # =========================================================================
             if inp_type == "radio":
+                group_label = await get_group_question(ctx, el) or label
                 group_radios = await ctx.query_selector_all(f'input[type="radio"][name="{name}"]') if name else [el]
                 radio_options = []
                 for r_el in group_radios:
-                    r_lbl = await get_element_label(ctx, r_el)
-                    if r_lbl and r_lbl != label:
+                    r_lbl = await get_option_label(ctx, r_el)
+                    if r_lbl and r_lbl not in radio_options:
                         radio_options.append(r_lbl)
 
                 # Check if already answered
@@ -751,31 +1239,33 @@ async def fill_form_on_page(
                 if any_checked:
                     continue
 
-                matched_val = get_field_match_by_rules(label, profile)
-                if not matched_val:
-                    matched_val = await ai_match_saved_answers(label, saved_answers, company_name=job_context)
+                # Check saved answers (memory) and non-sensitive deterministic rules
+                matched_val = await ai_match_saved_answers(group_label, saved_answers, company_name=job_context)
+                if not matched_val and not is_sensitive_question(group_label):
+                    matched_val = get_field_match_by_rules(group_label, profile)
 
                 if matched_val:
                     m_lower = str(matched_val).strip().lower()
                     for r_el in group_radios:
-                        r_lbl = await get_element_label(ctx, r_el)
+                        r_lbl = await get_option_label(ctx, r_el)
                         if r_lbl.lower() == m_lower or (m_lower == "yes" and r_lbl.lower().startswith("yes")) or (m_lower == "no" and r_lbl.lower().startswith("no")):
                             await r_el.click()
-                            result["fields_filled"].append({"field": label, "value": r_lbl})
+                            result["fields_filled"].append({"field": group_label, "value": r_lbl})
+                            record_filled(el_id, name, group_label, "input", "radio", r_lbl)
                             break
                     continue
 
                 # Pause on unknown radio group
-                ai_decision = await ai_generate_tailored_answer(label, profile, job_context=job_context, options=radio_options or ["Yes", "No"])
-                field_id = await el.get_attribute("id") or name or label
+                ai_decision = await ai_generate_tailored_answer(group_label, profile, job_context=job_context, options=radio_options or ["Yes", "No"])
+                field_id = await el.get_attribute("id") or name or group_label
                 result["needs_input"] = True
                 result["unanswered_question"] = {
                     "field_id": field_id,
-                    "label": label,
+                    "label": group_label,
                     "type": "select",
                     "options": radio_options or ["Yes", "No"]
                 }
-                result["ai_suggestion"] = ai_decision or "Yes"
+                result["ai_suggestion"] = ai_decision or (radio_options[0] if radio_options else "Yes")
                 result["completed"] = False
                 return result
 
@@ -785,36 +1275,32 @@ async def fill_form_on_page(
             if inp_type == "checkbox":
                 if await el.is_checked():
                     continue
-                lbl_lower = label.lower()
-                is_consent = any(w in lbl_lower for w in ["agree", "consent", "acknowledge", "certify", "confirm", "terms", "policy", "truthful"])
-                if is_consent:
+
+                opt_lbl = await get_option_label(ctx, el)
+                group_q = await get_group_question(ctx, el)
+                checkbox_label = group_q if (group_q and group_q != opt_lbl) else (opt_lbl or label)
+
+                # Policy: Consent, agreement, policy, and sensitive checkboxes must ALWAYS be confirmed by user
+                # unless explicitly approved and stored in reusable memory.
+                matched_val = await ai_match_saved_answers(checkbox_label, saved_answers, company_name=job_context)
+                if matched_val and str(matched_val).lower() in ["yes", "true", "check", "1", opt_lbl.lower()]:
                     await el.check()
-                    result["fields_filled"].append({"field": label, "value": "Checked (Consent)"})
+                    result["fields_filled"].append({"field": checkbox_label, "value": opt_lbl or "Checked (User Approved)"})
+                    record_filled(el_id, name, checkbox_label, "input", "checkbox", "Yes")
                     continue
 
-                matched_val = get_field_match_by_rules(label, profile)
-                if not matched_val:
-                    matched_val = await ai_match_saved_answers(label, saved_answers, company_name=job_context)
-
-                if str(matched_val).lower() in ["yes", "true", "check", "1"]:
-                    await el.check()
-                    result["fields_filled"].append({"field": label, "value": "Checked"})
-                    continue
-
-                # If required and uncertain, prompt user
-                is_required = await el.get_attribute("required") is not None or await el.get_attribute("aria-required") == "true"
-                if is_required:
-                    field_id = await el.get_attribute("id") or name or label
-                    result["needs_input"] = True
-                    result["unanswered_question"] = {
-                        "field_id": field_id,
-                        "label": label,
-                        "type": "select",
-                        "options": ["Yes", "No"]
-                    }
-                    result["ai_suggestion"] = "Yes"
-                    result["completed"] = False
-                    return result
+                # Pause on consent / agreement / required checkboxes
+                field_id = await el.get_attribute("id") or name or checkbox_label
+                result["needs_input"] = True
+                result["unanswered_question"] = {
+                    "field_id": field_id,
+                    "label": checkbox_label,
+                    "type": "select",
+                    "options": ["Yes", "No"]
+                }
+                result["ai_suggestion"] = "Yes"
+                result["completed"] = False
+                return result
                 continue
 
             # =========================================================================
@@ -833,6 +1319,7 @@ async def fill_form_on_page(
                 if matched_val:
                     await set_date_on_element(el, str(matched_val))
                     result["fields_filled"].append({"field": label, "value": str(matched_val)})
+                    record_filled(el_id, name, label, tag, "date", str(matched_val))
                     continue
 
                 # Prompt user with HTML5 interactive datepicker
@@ -866,15 +1353,20 @@ async def fill_form_on_page(
                 if curr_val and curr_val.strip():
                     continue
 
-                matched_value = get_field_match_by_rules(label, profile)
+                # Check saved answers (memory) and non-sensitive deterministic rules
+                matched_value = await ai_match_saved_answers(label, saved_answers, company_name=job_context)
+                if not matched_value and not is_sensitive_question(label):
+                    matched_value = get_field_match_by_rules(label, profile)
 
                 # Split phone number handling: avoid duplicate country codes
                 if matched_value and any(w in label.lower() for w in ["phone", "mobile", "cell"]):
-                    has_iti = bool(await ctx.query_selector('.iti__selected-dial-code, [class*="iti__selected"]'))
-                    if has_iti:
-                        matched_value = re.sub(r'^\+\d{1,3}\s*', '', str(matched_value)).strip()
+                    has_dial_dropdown = bool(await ctx.query_selector('.iti__selected-dial-code, [class*="iti__selected"], select[name*="countryCode"], select[id*="countryCode"], [aria-label*="country code"], [class*="dial-code"]'))
+                    raw_str = str(matched_value).strip()
+                    clean_digits = re.sub(r'^\+\d{1,3}\s*', '', raw_str).strip()
+                    if has_dial_dropdown or len(clean_digits) == 10:
+                        matched_value = clean_digits
 
-                if not matched_value:
+                if not matched_value and not is_sensitive_question(label):
                     tag_name = await el.evaluate("e => e.tagName.toLowerCase()")
                     field_intel = await ai_interpret_field(label, tag_type=tag_name)
                     intent = field_intel.get("intent", "custom_question")
@@ -889,8 +1381,20 @@ async def fill_form_on_page(
                         matched_value = await ai_generate_tailored_answer(label, profile, job_context=job_context)
 
                 if matched_value:
-                    await el.fill(str(matched_value))
+                    # Numeric input safety (input[type="number"] requires digits or decimals)
+                    if inp_type == "number":
+                        num_match = re.search(r'\d+(?:\.\d+)?', str(matched_value))
+                        matched_value = num_match.group(0) if num_match else "0"
+
+                    # Check for masked inputs (e.g. placeholder with (___) or xxx-xxx)
+                    ph = (await el.get_attribute("placeholder") or "").lower()
+                    if any(m in ph for m in ["(___)", "xxx-xxx", "___-___", "(123)"]):
+                        await el.focus()
+                        await el.type(str(matched_value), delay=30)
+                    else:
+                        await el.fill(str(matched_value))
                     result["fields_filled"].append({"field": label, "value": str(matched_value)})
+                    record_filled(el_id, name, label, tag, inp_type or "text", str(matched_value), selector=f"#{el_id}" if el_id else "")
                     continue
 
                 # Skip optional notes
@@ -917,11 +1421,28 @@ async def fill_form_on_page(
             print(f"Error handling form element [{el_idx}]: {e}")
             continue
 
-    # POST-FILL VALIDATION & REQUIRED-FIELD VERIFICATION
-    errors = await check_validation_errors(ctx)
-    if errors:
-        result["validation_errors"] = errors
-        print(f"[Form Validation] Field errors detected on page: {errors}")
+    # DYNAMIC FILE CHOOSER FALLBACK (For dropzones/buttons where input[type="file"] is instantiated on click)
+    has_uploaded_resume = any("resume" in f["field"].lower() or "attach" in f["field"].lower() for f in result["fields_filled"])
+    if not has_uploaded_resume and resume_path and os.path.exists(resume_path):
+        try:
+            upload_btn = await ctx.query_selector('button:has-text("Attach Resume"), button:has-text("Upload Resume"), [data-automation-id="file-upload-drop-zone"], .btn-upload-resume')
+            if upload_btn and await upload_btn.is_visible():
+                async with page.expect_file_chooser(timeout=3000) as fc_info:
+                    await upload_btn.click()
+                file_chooser = await fc_info.value
+                await file_chooser.set_files(resume_path)
+                result["fields_filled"].append({"field": "Resume Upload", "value": os.path.basename(resume_path)})
+                record_filled("resume", "resume", "Resume Upload", "input", "file", resume_path)
+        except Exception:
+            pass
+
+    # POST-FILL VALIDATION & REQUIRED-FIELD VERIFICATION (Re-reads all fields)
+    verification = await verify_form_completion_and_errors(ctx)
+    if not verification["is_valid"]:
+        result["validation_errors"] = verification["validation_errors"]
+        result["empty_required_fields"] = verification["empty_required_fields"]
+        print(f"[Form Verification] Validation errors: {verification['validation_errors']}")
+        print(f"[Form Verification] Empty required fields: {verification['empty_required_fields']}")
 
     # MULTI-STEP WIZARD & ACCIDENTAL SUBMIT GUARD
     buttons = await ctx.query_selector_all('button, input[type="submit"]')
@@ -930,12 +1451,17 @@ async def fill_form_on_page(
             if not await btn.is_visible() or await btn.is_disabled():
                 continue
             txt = (await btn.inner_text() or await btn.get_attribute("value") or "").lower().strip()
+            
+            # Submit button guard: submission buttons must NEVER trigger multi-page advance
+            is_submit = any(w in txt for w in ["submit", "apply now", "finish", "complete application", "submit application"])
+            if is_submit:
+                result["submit_button_found"] = True
+                continue
+
             # Only trigger multi-page if it's explicitly an enabled next/step button
             if any(w == txt or f" {w}" in txt or f"{w} " in txt for w in ["next", "step 2", "save and continue", "next page", "next step", "continue to next"]):
                 result["has_next_page"] = True
                 break
-            if any(w in txt for w in ["submit", "apply now", "finish", "complete application", "submit application"]):
-                result["submit_button_found"] = True
         except Exception:
             pass
 

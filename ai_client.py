@@ -74,74 +74,26 @@ async def ai_match_saved_answers(
     company_name: str = ""
 ) -> Optional[str]:
     """
-    Use AI to determine if any previously approved saved answer answers the current question.
+    Lookup matching saved answer using exact normalized match, followed by embeddings similarity (threshold >= 0.85).
+    Guarantees zero hallucination.
     """
-    if not saved_answers:
+    if not saved_answers or not question_text:
         return None
 
-    # Normalize query question
-    q_clean = re.sub(r'[^\w\s]', '', question_text.lower()).strip()
-    q_norm = re.sub(r'\s+', ' ', q_clean)
-
-    # 1. Company-specific exact match
-    if company_name:
-        c_lower = company_name.lower().strip()
-        for item in saved_answers:
-            if item.get("scope") == "company" and item.get("company_name", "").lower().strip() == c_lower:
-                item_norm = item.get("normalized_text") or re.sub(r'\s+', ' ', re.sub(r'[^\w\s]', '', item.get("question_pattern", "").lower()).strip())
-                if item_norm == q_norm:
-                    print(f"[AI Memory] Company-specific exact match found for '{question_text}' -> '{item['answer']}'")
-                    try:
-                        from database import touch_saved_answer
-                        touch_saved_answer(item.get("id"))
-                    except Exception:
-                        pass
-                    return item["answer"]
-
-    # 2. Global exact match
-    for item in saved_answers:
-        item_norm = item.get("normalized_text") or re.sub(r'\s+', ' ', re.sub(r'[^\w\s]', '', item.get("question_pattern", "").lower()).strip())
-        if item_norm == q_norm:
-            print(f"[AI Memory] Global exact match found for '{question_text}' -> '{item['answer']}'")
-            try:
-                from database import touch_saved_answer
-                touch_saved_answer(item.get("id"))
-            except Exception:
-                pass
-            return item["answer"]
-
-    # 3. Direct pattern / substring match
-    q_raw = question_text.lower().strip()
-    for item in saved_answers:
-        pattern = item.get("question_pattern", "").lower().strip()
-        if pattern and (pattern in q_raw or q_raw in pattern):
-            print(f"[AI Memory] Exact pattern match found for '{question_text}' -> '{item['answer']}'")
-            try:
-                from database import touch_saved_answer
-                touch_saved_answer(item.get("id"))
-            except Exception:
-                pass
-            return item["answer"]
-
-    # If no direct match, ask Qwen to compare semantic similarity
-    candidates_text = ""
-    for idx, ans in enumerate(saved_answers[:5]):
-        candidates_text += f"[{idx+1}] Question: \"{ans['question_pattern']}\" | Saved Answer: \"{ans['answer']}\"\n"
-
-    prompt = f"""Job Application Question: "{question_text}"
-Company: "{company_name}"
-
-Here are approved saved answers from previous applications:
-{candidates_text}
-
-Does any saved answer directly answer the current question?
-If yes, output ONLY the exact text of the matching saved answer.
-If no saved answer fits, output: "NO_MATCH"."""
-
-    resp = await call_qwen(prompt, max_tokens=100)
-    if resp and "NO_MATCH" not in resp.upper():
-        print(f"[AI Memory] Qwen semantically matched saved answer: '{resp}'")
-        return resp.strip()
+    try:
+        from field_lookup import lookup_field_value, LookupStage
+        val, stage, meta = await lookup_field_value(
+            label=question_text,
+            field_type="text",
+            saved_answers=saved_answers,
+            profile={}, # memory stages only
+            company_name=company_name,
+            similarity_threshold=0.85
+        )
+        if val and stage in [LookupStage.EXACT_MEMORY, LookupStage.SIMILARITY_EMBEDDINGS]:
+            return val
+    except Exception as e:
+        print(f"[AIMatchSavedAnswers] Error: {e}")
 
     return None
 

@@ -57,7 +57,9 @@ def get_field_match_by_rules(label: str, profile: Dict[str, Any]) -> Optional[st
         return "0"
 
     # Notice period / availability
-    if re.search(r'\b(notice\s*period|availability)\b', lbl):
+    if re.search(r'\b(available\s*to\s*join\s*\(in\s*days\)|notice\s*period\s*\(in\s*days\)|notice\s*days)\b', lbl):
+        return "0"
+    if re.search(r'\b(notice\s*period|availability|available\s*to\s*join)\b', lbl):
         return "Immediate"
 
     # Dates: Date of Joining, Relieving, Birth Date
@@ -94,37 +96,31 @@ def get_field_match_by_rules(label: str, profile: Dict[str, Any]) -> Optional[st
     if re.search(r'\b(portfolio|website|personal\s*site|url)\b', lbl):
         return profile.get("portfolio_url", "")
 
-    # Education: Degree, School, Major, Graduation Date
+    # Education: Degree, School, Major, GPA, Graduation Date
+    edus = profile.get("education", [])
+    first_edu = edus[0] if isinstance(edus, list) and len(edus) > 0 and isinstance(edus[0], dict) else {}
+
+    if re.search(r'\b(gpa|cgpa|grade\s*point|percentage|academic\s*score)\b', lbl):
+        if first_edu.get("gpa"):
+            return str(first_edu["gpa"])
+
     if re.search(r'\b(degree|highest\s*education|level\s*of\s*education)\b', lbl):
-        return "Bachelor's Degree"
+        return first_edu.get("degree") or "Bachelor's Degree"
 
     if re.search(r'\b(discipline|major|field\s*of\s*study|course)\b', lbl):
-        return "Computer Science and Engineering"
+        return first_edu.get("field_of_study") or "Computer Science and Engineering"
 
     if re.search(r'\b(school|university|college|institution)\b', lbl):
-        return "Govt. Model Engineering College"
+        return first_edu.get("institution") or "Govt. Model Engineering College"
 
     if re.search(r'\b(grad(uation)?\s*year|end\s*year|completion\s*year)\b', lbl):
-        return "2027"
+        return str(first_edu.get("end_year") or "2027")
 
     if re.search(r'\b(start\s*year)\b', lbl):
         return "2023"
 
-    # Demographics & Equal Opportunity (EEOC)
-    if re.search(r'^(gender|sex)$|\b(your\s*gender|identify\s*your\s*gender)\b', lbl):
-        return "Male"
-
-    if re.search(r'\bpronouns?\b', lbl):
-        return "he/him"
-
-    if re.search(r'\b(hispanic|latino)\b', lbl):
-        return "No"
-
-    if re.search(r'\bveteran\b', lbl):
-        return "I am not a protected veteran"
-
-    if re.search(r'\bdisabilit(y|ies)\b', lbl):
-        return "No"
+    if re.search(r'\b(board|university\s*board)\b', lbl):
+        return first_edu.get("board_or_university") or "KTU"
 
     return None
 
