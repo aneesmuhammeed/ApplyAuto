@@ -179,6 +179,20 @@ class ApplyMateWorker:
         saved_answers = get_saved_answers()
         resume_path = profile.get("resume_file_path")
 
+        # Verify profile completeness before processing application
+        completeness = calculate_profile_completeness(profile)
+        if not completeness.get("is_complete") and len(completeness.get("missing_fields", [])) > 2:
+            missing_names = [f["label"] for f in completeness.get("missing_fields", [])[:3]]
+            warn_msg = f"Candidate Profile has critical missing fields: {missing_names}. Please update your profile in the dashboard."
+            await self.log_app(app_id, f"[Profile Warning] {warn_msg}")
+            print(f"[Worker] {warn_msg}")
+
+        # Check resume file exists on disk
+        if resume_path and not os.path.exists(resume_path):
+            missing_resume_msg = f"Resume document path '{resume_path}' does not exist on disk. Please upload your resume in the dashboard."
+            await self.log_app(app_id, f"[File Error] {missing_resume_msg}")
+            print(f"[Worker] {missing_resume_msg}")
+
         # Each application gets its own dedicated page in the persistent context
         page = await self.get_or_create_page(app_id)
 

@@ -115,15 +115,32 @@ def parse_resume(file_path: str) -> Dict[str, Any]:
     em = re.search(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', raw_text)
     if em: parsed["email"] = em.group(0)
 
-    ph = re.search(r'(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', raw_text)
-    if ph: parsed["phone"] = ph.group(0)
+    # Phone: Support international codes like +91 8078830836, +1 (555) 019-2834, etc.
+    ph = re.search(r'(?:\+91[\s\-]?)?[6-9]\d{9}|(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', raw_text)
+    if ph: parsed["phone"] = ph.group(0).strip()
 
     dob = re.search(r'DOB\s*[\-–:]\s*(\d{2}[\/\-]\d{2}[\/\-]\d{4})', raw_text, re.I)
     if dob: parsed["dob"] = dob.group(1)
 
-    loc = re.search(r'(Kochi,\s*Kerala,\s*India|Govt\.\s*Model Engineering College,\s*Kochi|[A-Za-z\s]+College,\s*[A-Za-z\s]+)', raw_text)
+    # Location: Match standard "City, State, Country", "City, State", "City, Country", or known Indian/global formats
+    loc = re.search(
+        r'\b([A-Z][a-zA-Z\s\.]+,\s*[A-Z][a-zA-Z\s\.]+(?:,\s*[A-Z][a-zA-Z\s\.]+)?)\b',
+        raw_text
+    )
     if loc:
-        parsed["location"] = loc.group(0).split("\n")[0].strip()
+        # Validate that matched location doesn't look like an email or institution
+        candidate_loc = loc.group(1).split("\n")[0].strip()
+        if not any(k in candidate_loc.lower() for k in ["college", "university", "school", "institute", "hospital", "technologies", "solutions"]):
+            parsed["location"] = candidate_loc
+    if not parsed["location"]:
+        # Fallback to broader location pattern including college city if present
+        loc_fallback = re.search(r'(?:Location|Address|Place)\s*[:\-–]\s*([^\n\r]+)', raw_text, re.I)
+        if loc_fallback:
+            parsed["location"] = loc_fallback.group(1).strip()
+        else:
+            loc_alt = re.search(r'([A-Za-z\s]+College,\s*[A-Za-z\s]+|Kochi,\s*Kerala,\s*India)', raw_text)
+            if loc_alt:
+                parsed["location"] = loc_alt.group(0).split("\n")[0].strip()
 
     # 3. Section Boundary Parsing
     sections: Dict[str, List[str]] = {}

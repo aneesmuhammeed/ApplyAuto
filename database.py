@@ -18,6 +18,52 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
+CURRENT_SCHEMA_VERSION = 2
+
+def run_migrations(conn: sqlite3.Connection):
+    """
+    Versioned schema migration using SQLite PRAGMA user_version.
+    Ensures existing databases upgrade safely without data loss.
+    """
+    cursor = conn.cursor()
+    version_row = cursor.execute("PRAGMA user_version").fetchone()
+    current_version = version_row[0] if version_row else 0
+
+    tables = [t[0] for t in cursor.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+
+    if current_version < 1:
+        # Migration 1: Ensure initial columns, triggers, and indices
+        if "applications" in tables:
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_apps_status_created ON applications(status, created_at)")
+        if "saved_answers" in tables:
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_saved_answers_qkey ON saved_answers(question_key)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_saved_answers_norm ON saved_answers(normalized_text)")
+        cursor.execute("PRAGMA user_version = 1")
+        conn.commit()
+        current_version = 1
+
+    if current_version < 2:
+        # Migration 2: Verify all extended profile and application columns exist
+        if "applications" in tables:
+            app_cols = [c[1] for c in cursor.execute("PRAGMA table_info(applications)").fetchall()]
+            for col, col_def in [
+                ("verification_failed", "INTEGER DEFAULT 0"),
+                ("verification_confirmed", "INTEGER DEFAULT 0"),
+                ("requires_manual_confirmation", "INTEGER DEFAULT 0"),
+                ("verification_failures", "TEXT DEFAULT '[]'"),
+                ("pre_submit_screenshot", "TEXT DEFAULT ''"),
+                ("post_submit_screenshot", "TEXT DEFAULT ''"),
+                ("answer_scope", "TEXT DEFAULT 'global'"),
+                ("unanswered_questions", "TEXT DEFAULT '[]'"),
+                ("batch_answers", "TEXT DEFAULT '[]'")
+            ]:
+                if col not in app_cols:
+                    cursor.execute(f"ALTER TABLE applications ADD COLUMN {col} {col_def}")
+
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_apps_status_created ON applications(status, created_at)")
+        cursor.execute("PRAGMA user_version = 2")
+        conn.commit()
+
 def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -107,88 +153,6 @@ def init_db():
     )
     """)
 
-    # Run column migrations for existing databases
-    existing_cols = [c[1] for c in cursor.execute("PRAGMA table_info(saved_answers)").fetchall()]
-    if "question_key" not in existing_cols:
-        cursor.execute("ALTER TABLE saved_answers ADD COLUMN question_key TEXT DEFAULT ''")
-    if "normalized_text" not in existing_cols:
-        cursor.execute("ALTER TABLE saved_answers ADD COLUMN normalized_text TEXT DEFAULT ''")
-    if "field_type" not in existing_cols:
-        cursor.execute("ALTER TABLE saved_answers ADD COLUMN field_type TEXT DEFAULT 'text'")
-    if "options_seen" not in existing_cols:
-        cursor.execute("ALTER TABLE saved_answers ADD COLUMN options_seen TEXT DEFAULT '[]'")
-    if "source" not in existing_cols:
-        cursor.execute("ALTER TABLE saved_answers ADD COLUMN source TEXT DEFAULT 'user'")
-    if "scope" not in existing_cols:
-        cursor.execute("ALTER TABLE saved_answers ADD COLUMN scope TEXT DEFAULT 'global'")
-    if "company_name" not in existing_cols:
-        cursor.execute("ALTER TABLE saved_answers ADD COLUMN company_name TEXT DEFAULT ''")
-    if "last_used" not in existing_cols:
-        cursor.execute("ALTER TABLE saved_answers ADD COLUMN last_used TEXT DEFAULT ''")
-
-    # Indices and trigger for automatic question_key generation
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_saved_answers_qkey ON saved_answers(question_key)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_saved_answers_norm ON saved_answers(normalized_text)")
-    cursor.execute("""
-    CREATE TRIGGER IF NOT EXISTS trg_saved_answers_auto_qkey
-    AFTER INSERT ON saved_answers
-    FOR EACH ROW
-    WHEN NEW.question_key IS NULL OR NEW.question_key = ''
-    BEGIN
-        UPDATE saved_answers
-        SET question_key = LOWER(
-            SUBSTR(
-                REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(NEW.question_pattern, '?', ''), '!', ''), '.', ''), ' ', '_'), '-', '_'),
-                1, 40
-            )
-        )
-        WHERE id = NEW.id;
-    END;
-    """)
-
-    # Migrations for applications table
-    app_cols = [c[1] for c in cursor.execute("PRAGMA table_info(applications)").fetchall()]
-    if "answer_scope" not in app_cols:
-        cursor.execute("ALTER TABLE applications ADD COLUMN answer_scope TEXT DEFAULT 'global'")
-    if "unanswered_questions" not in app_cols:
-        cursor.execute("ALTER TABLE applications ADD COLUMN unanswered_questions TEXT DEFAULT '[]'")
-    if "batch_answers" not in app_cols:
-        cursor.execute("ALTER TABLE applications ADD COLUMN batch_answers TEXT DEFAULT '[]'")
-    if "verification_failed" not in app_cols:
-        cursor.execute("ALTER TABLE applications ADD COLUMN verification_failed INTEGER DEFAULT 0")
-    if "verification_confirmed" not in app_cols:
-        cursor.execute("ALTER TABLE applications ADD COLUMN verification_confirmed INTEGER DEFAULT 0")
-    if "requires_manual_confirmation" not in app_cols:
-        cursor.execute("ALTER TABLE applications ADD COLUMN requires_manual_confirmation INTEGER DEFAULT 0")
-    if "verification_failures" not in app_cols:
-        cursor.execute("ALTER TABLE applications ADD COLUMN verification_failures TEXT DEFAULT '[]'")
-    if "pre_submit_screenshot" not in app_cols:
-        cursor.execute("ALTER TABLE applications ADD COLUMN pre_submit_screenshot TEXT DEFAULT ''")
-    if "post_submit_screenshot" not in app_cols:
-        cursor.execute("ALTER TABLE applications ADD COLUMN post_submit_screenshot TEXT DEFAULT ''")
-
-    # Migrations for profiles table
-    prof_cols = [c[1] for c in cursor.execute("PRAGMA table_info(profiles)").fetchall()]
-    new_prof_cols = {
-        "phone_code": "TEXT DEFAULT '+91'",
-        "country": "TEXT DEFAULT 'India'",
-        "preferred_location": "TEXT DEFAULT ''",
-        "total_experience_years": "TEXT DEFAULT ''",
-        "total_experience_months": "TEXT DEFAULT ''",
-        "notice_period": "TEXT DEFAULT ''",
-        "notice_period_days": "TEXT DEFAULT ''",
-        "current_salary": "TEXT DEFAULT ''",
-        "expected_salary": "TEXT DEFAULT ''",
-        "currency": "TEXT DEFAULT 'INR'",
-        "gender": "TEXT DEFAULT ''",
-        "pronouns": "TEXT DEFAULT ''",
-        "birth_date": "TEXT DEFAULT ''",
-        "referral_source": "TEXT DEFAULT 'LinkedIn'"
-    }
-    for col_name, col_type in new_prof_cols.items():
-        if col_name not in prof_cols:
-            cursor.execute(f"ALTER TABLE profiles ADD COLUMN {col_name} {col_type}")
-
     # 4. Worker Status Heartbeat
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS worker_status (
@@ -200,7 +164,7 @@ def init_db():
     )
     """)
 
-    # 5. Persistent Embedding Cache (keyed by normalized_pattern)
+    # 5. Persistent Embedding Cache
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS embedding_cache (
         normalized_pattern TEXT PRIMARY KEY,
@@ -210,7 +174,7 @@ def init_db():
     )
     """)
 
-    # 6. Persistent LLM Cache (keyed by cache_key = e.g. interpret/choice/freetext + normalized label)
+    # 6. Persistent LLM Cache
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS llm_cache (
         cache_key TEXT PRIMARY KEY,
@@ -221,6 +185,9 @@ def init_db():
     )
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_llm_cache_type ON llm_cache(cache_type)")
+
+    # Run versioned migrations
+    run_migrations(conn)
 
     # Default profile record
     cursor.execute("SELECT id FROM profiles WHERE id = 'default'")
@@ -702,10 +669,26 @@ def update_application(app_id: str, updates: Dict[str, Any]):
     now = time.strftime('%Y-%m-%d %H:%M:%S')
     updates["updated_at"] = now
     
-    # JSON serialize any dict/list fields
+    # JSON serialize any dict/list fields, with size guard on form_data (max 512KB)
     for field in ["form_data", "unanswered_question", "unanswered_questions", "batch_answers", "logs", "verification_failures"]:
-        if field in updates and isinstance(updates[field], (dict, list)):
-            updates[field] = json.dumps(updates[field])
+        if field in updates:
+            val = updates[field]
+            if isinstance(val, (dict, list)):
+                s = json.dumps(val)
+                # Form data snapshot size limit guard
+                if field == "form_data" and len(s) > 524288:  # 512KB
+                    # Truncate large histories inside form_data if oversized
+                    if isinstance(val, dict) and "fields" in val:
+                        trimmed = {"fields": val.get("fields", {}), "question_attempts": val.get("question_attempts", {})}
+                        s = json.dumps(trimmed)
+                updates[field] = s
+            elif isinstance(val, str) and field == "form_data" and len(val) > 524288:
+                try:
+                    parsed = json.loads(val)
+                    if isinstance(parsed, dict) and "fields" in parsed:
+                        updates[field] = json.dumps({"fields": parsed.get("fields", {}), "question_attempts": parsed.get("question_attempts", {})})
+                except Exception:
+                    pass
             
     cols = ", ".join([f"{k} = ?" for k in updates.keys()])
     values = list(updates.values()) + [app_id]
@@ -763,8 +746,8 @@ def delete_application(app_id: str):
 
 def normalize_question_key(text: str) -> str:
     """Normalize question text for consistent dictionary/hash lookup."""
-    t = text.lower().strip()
-    t = re.sub(r'[^\w\s]', '', t)
+    t = (text or "").lower().strip()
+    t = re.sub(r'[^\w\s]', '', t, flags=re.UNICODE)
     t = re.sub(r'\s+', ' ', t)
     return t
 
@@ -826,8 +809,12 @@ def generate_question_key(text: str, field_type: str = "text", company_name: str
         words = norm.split()[:6]
         key_base = "_".join(words)[:48] if words else "question"
 
+    # Differentiate field type if not standard text
+    if field_type and field_type.lower() not in ("text", ""):
+        key_base = f"{key_base}_{field_type.lower()}"
+
     if scope in ["company", "this company"] and company_name:
-        comp_slug = re.sub(r'[^\w\s]', '', company_name.lower()).strip()
+        comp_slug = re.sub(r'[^\w\s]', '', company_name.lower(), flags=re.UNICODE).strip()
         comp_slug = re.sub(r'\s+', '_', comp_slug)[:20]
         return f"{comp_slug}:{key_base}"
     return key_base
