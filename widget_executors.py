@@ -417,12 +417,15 @@ class NativeSelectWidgetExecutor(BaseWidgetExecutor):
 
         # Extract available options
         options_data = await element.evaluate("""sel => {
+            if (!sel || !sel.options) return [];
             return Array.from(sel.options).map((opt, idx) => ({
                 index: idx,
-                value: opt.value,
-                text: opt.text.trim()
+                value: opt.value || '',
+                text: (opt.text || '').trim()
             }));
         }""")
+        if not options_data:
+            return False
 
         candidates = [
             (opt, opt["text"] if opt["text"] else opt["value"])
@@ -457,12 +460,15 @@ class NativeSelectWidgetExecutor(BaseWidgetExecutor):
         if not target:
             return
         options_data = await element.evaluate("""sel => {
+            if (!sel || !sel.options) return [];
             return Array.from(sel.options).map((opt, idx) => ({
                 index: idx,
-                value: opt.value,
-                text: opt.text.trim()
+                value: opt.value || '',
+                text: (opt.text || '').trim()
             }));
         }""")
+        if not options_data:
+            return
         candidates = [
             (opt, opt["text"] if opt["text"] else opt["value"])
             for opt in options_data
@@ -472,6 +478,7 @@ class NativeSelectWidgetExecutor(BaseWidgetExecutor):
         if match:
             idx = match[0]["index"]
             await element.evaluate("""(sel, idx) => {
+                if (!sel || !sel.options) return;
                 sel.selectedIndex = idx;
                 sel.dispatchEvent(new Event('input', { bubbles: true }));
                 sel.dispatchEvent(new Event('change', { bubbles: true }));
@@ -480,12 +487,16 @@ class NativeSelectWidgetExecutor(BaseWidgetExecutor):
     async def verify(self, ctx: Union[Page, Frame], element: ElementHandle, expected_value: Any, **kwargs) -> Tuple[bool, Optional[str]]:
         """Re-reads the currently selected option from the native select in DOM."""
         sel_info = await element.evaluate("""sel => {
+            if (!sel || !sel.options) {
+                const val = (sel && (sel.value || sel.innerText)) || '';
+                return { text: val.trim(), value: val.trim(), index: -1 };
+            }
             const idx = sel.selectedIndex;
-            if (idx === -1 || !sel.options[idx]) return { text: '', value: '', index: -1 };
+            if (idx === -1 || idx === undefined || !sel.options[idx]) return { text: '', value: '', index: -1 };
             const opt = sel.options[idx];
             return {
-                text: opt.text.trim(),
-                value: opt.value.trim(),
+                text: (opt.text || '').trim(),
+                value: (opt.value || '').trim(),
                 index: idx
             };
         }""")
@@ -1080,10 +1091,42 @@ class WidgetExecutorRegistry:
         widget_type: Optional[str] = None,
         **kwargs
     ) -> ExecutionResult:
+        dom_type = await self.detect_widget_type(ctx, element)
+        tag = ""
+        try:
+            tag = await element.evaluate("e => e.tagName ? e.tagName.toLowerCase() : ''")
+        except Exception:
+            pass
+
         if not widget_type:
-            widget_type = await self.detect_widget_type(ctx, element)
-        executor = self.get_executor(widget_type)
-        return await executor.execute(ctx, element, value, **kwargs)
+            target_type = dom_type
+        else:
+            w_norm = str(widget_type).lower().strip()
+            # If caller says native select, element MUST be an actual <select> tag in DOM
+            if w_norm in ["select", "native_select"]:
+                if tag == "select":
+                    target_type = WidgetType.NATIVE_SELECT
+                else:
+                    # Inaccurate question metadata: element is actually a combobox/input in DOM
+                    target_type = dom_type if dom_type != WidgetType.TEXT else WidgetType.CUSTOM_COMBOBOX
+            elif w_norm in ["combobox", "custom_combobox"] and tag == "select":
+                # Element in DOM is actually a native select
+                target_type = WidgetType.NATIVE_SELECT
+            elif w_norm in ["text"] and dom_type in [WidgetType.CUSTOM_COMBOBOX, WidgetType.NATIVE_SELECT, WidgetType.RADIO, WidgetType.CHECKBOX, WidgetType.DATE]:
+                # Live DOM is a structured widget
+                target_type = dom_type
+            else:
+                target_type = w_norm
+
+        executor = self.get_executor(target_type)
+        res = await executor.execute(ctx, element, value, **kwargs)
+
+        # Fallback: if native select failed on a non-select DOM element, retry with custom combobox
+        if (not res.success or not res.verification_passed) and target_type == WidgetType.NATIVE_SELECT and tag != "select":
+            cb_executor = self.get_executor(WidgetType.CUSTOM_COMBOBOX)
+            res = await cb_executor.execute(ctx, element, value, **kwargs)
+
+        return res
 
 # Global singleton
 widget_registry = WidgetExecutorRegistry()

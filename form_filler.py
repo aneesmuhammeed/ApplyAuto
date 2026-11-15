@@ -1103,7 +1103,7 @@ async def fill_form_on_page(
                     collect_unanswered_question(
                         field_id=field_id,
                         label=label,
-                        field_type="select",
+                        field_type="combobox",
                         options=options,
                         ai_suggestion=ai_decision or "",
                         category="general"
@@ -1115,7 +1115,7 @@ async def fill_form_on_page(
                     collect_unanswered_question(
                         field_id=field_id,
                         label=label,
-                        field_type="select",
+                        field_type="combobox",
                         options=fallback_options,
                         ai_suggestion=ai_decision or "",
                         category="general"
@@ -1137,8 +1137,8 @@ async def fill_form_on_page(
             # 3. NATIVE SELECT DROPDOWNS (<select>)
             # =========================================================================
             if tag == "select":
-                selected_val = await el.evaluate("sel => sel.value ? sel.value.trim() : ''")
-                selected_text = await el.evaluate("sel => sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].text.trim() : ''")
+                selected_val = await el.evaluate("sel => sel && sel.value ? sel.value.trim() : ''")
+                selected_text = await el.evaluate("sel => (sel && sel.options && sel.selectedIndex >= 0 && sel.options[sel.selectedIndex]) ? sel.options[sel.selectedIndex].text.trim() : ''")
                 is_placeholder = (
                     not selected_val or
                     selected_text.lower() in ["", "select", "choose"] or
@@ -1160,6 +1160,7 @@ async def fill_form_on_page(
                 is_phone_dial_code = "countrycode" in el_id or "countrycode" in name.lower() or any(w in label.lower() for w in ["country code", "dial code", "+91"]) or (opt_texts and any(ot in ["+91", "+93"] for ot in opt_texts[:10]))
                 if is_phone_dial_code:
                     await el.evaluate("""(sel) => {
+                        if (!sel || !sel.options) return;
                         let match = null;
                         for (let o of sel.options) {
                             if (o.value === '+91' || o.text.includes('+91') || o.text.toLowerCase().includes('india')) {
@@ -1183,6 +1184,7 @@ async def fill_form_on_page(
                 is_currency = "currency" in el_id or "currency" in name.lower() or (opt_texts and any(ot in ["INR", "USD", "EUR"] for ot in opt_texts[:10]))
                 if is_currency:
                     await el.evaluate("""(sel) => {
+                        if (!sel || !sel.options) return;
                         let match = null;
                         for (let o of sel.options) {
                             if (o.value === 'INR' || o.text.includes('INR') || o.text.toLowerCase().includes('rupee')) {
@@ -1206,6 +1208,7 @@ async def fill_form_on_page(
                 select_options = []
                 try:
                     select_options = await el.evaluate("""sel => {
+                        if (!sel || !sel.options) return [];
                         return Array.from(sel.options).map(o => o.text.trim()).filter(Boolean);
                     }""")
                 except Exception:
