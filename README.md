@@ -92,10 +92,11 @@ cp .env.example .env
 ApplyMate is modular; start the services in separate terminals:
 
 ### 1. Start Local LLM (`llama-server`)
-Ensure your local `llama-server` is active on port `1234`:
+Ensure your local `llama-server` is active on port `1234` with at least `-c 8192` context size:
 ```powershell
-llama-server -m path\to\qwen3-0.6b-q3_k_m.gguf --port 1234 -c 2048
+llama-server -m path\to\qwen3-0.6b-q3_k_m.gguf --port 1234 -c 8192
 ```
+> **Note**: Running with `-c 8192` ensures sufficient context window capacity for long job descriptions, custom question evaluation, and system instructions without truncation.
 
 ### 2. Start FastAPI Backend Server
 ```powershell
