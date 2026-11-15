@@ -123,10 +123,13 @@ npm run dev
 To review, answer unknown questions, or manage Answer Memory without opening the browser:
 ```powershell
 # Review pending batches and answer questions directly in terminal
-python backend/cli.py
+python backend/cli.py list
+python backend/cli.py answer
 
 # Inspect, edit, or delete saved answers from Answer Memory
-python backend/field_lookup.py --review-memory
+python backend/manage_memory.py list
+python backend/manage_memory.py edit <id> --answer "Your answer"
+python backend/manage_memory.py delete <id>
 ```
 
 ### 6. (Optional) Run Telegram Bot

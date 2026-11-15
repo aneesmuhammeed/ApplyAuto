@@ -933,7 +933,8 @@ class ApplyMateWorker:
                 if submitting_tasks:
                     submitting_tasks.sort(key=lambda x: x.get("created_at") or "")
                     await self.submit_application(submitting_tasks[0])
-                    await asyncio.sleep(settings.POLL_INTERVAL)
+                    # Minimal pause after immediate work to prevent unnecessary wait
+                    await asyncio.sleep(0.1)
                     continue
 
                 # 2. Check for answered batch questions on 'needs_input' tasks - Oldest First
@@ -945,7 +946,8 @@ class ApplyMateWorker:
                 if answered_tasks:
                     answered_tasks.sort(key=lambda x: x.get("created_at") or "")
                     await self.process_task(answered_tasks[0])
-                    await asyncio.sleep(settings.POLL_INTERVAL)
+                    # Minimal pause after immediate work to prevent unnecessary wait
+                    await asyncio.sleep(0.1)
                     continue
 
                 # 3. Check for 'queued' tasks - Atomically acquire OLDEST FIRST!
@@ -953,7 +955,8 @@ class ApplyMateWorker:
                 task_to_run = acquire_queued_application(self.worker_id)
                 if task_to_run:
                     await self.process_task(task_to_run)
-                    await asyncio.sleep(settings.POLL_INTERVAL)
+                    # Minimal pause after immediate work to prevent unnecessary wait
+                    await asyncio.sleep(0.1)
                     continue
 
                 # Applications in needs_input (waiting for user answer), paused, or waiting_review

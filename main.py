@@ -3,6 +3,7 @@ import re
 import hmac
 import uuid
 import shutil
+import asyncio
 from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +19,10 @@ from database import (
     get_worker_status
 )
 from resume_parser import parse_resume
+
+def _write_file_sync(dest: str, data: bytes) -> None:
+    with open(dest, "wb") as buffer:
+        buffer.write(data)
 
 app = FastAPI(title="ApplyMate Local API", version="2.0.0")
 
@@ -328,8 +333,9 @@ async def upload_resume(file: UploadFile = File(...)):
     # Save under a random UUID-based name to avoid collisions and path manipulation
     safe_filename = f"{uuid.uuid4().hex}{ext}"
     file_dest = os.path.join(settings.RESUME_STORAGE_DIR, safe_filename)
-    with open(file_dest, "wb") as buffer:
-        buffer.write(contents)
+    
+    # Offload blocking disk write to threadpool
+    await asyncio.to_thread(_write_file_sync, file_dest, contents)
 
     parsed = parse_resume(file_dest)
 
