@@ -3,6 +3,7 @@ import re
 import time
 import base64
 import asyncio
+import hashlib
 from typing import Optional, Dict, Any, List
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from config import settings
@@ -26,6 +27,8 @@ class ApplyMateWorker:
         self.pages: Dict[str, Page] = {}  # Per-application page mapping: app_id -> Page
         self.is_running = True
         self.worker_id = "laptop-worker"
+        self.app_attempts: Dict[str, Dict[str, int]] = {}  # Per-app question retry attempts: app_id -> {q_key: count}
+        self.last_telegram_batch_hash: Dict[str, str] = {}  # Per-app last notified batch hash: app_id -> hash
 
     @property
     def page(self) -> Optional[Page]:
@@ -275,6 +278,17 @@ class ApplyMateWorker:
                 if ans_val is None or str(ans_val).strip() == "":
                     continue
 
+                # Unique key for tracking attempts per question per application
+                q_key = (ans_field_id or ans_lbl).strip().lower()
+                app_attempts_map = self.app_attempts.setdefault(app_id, {})
+                current_attempt = app_attempts_map.get(q_key, 0)
+
+                # Exponential backoff delay if this question was previously attempted
+                if current_attempt > 0:
+                    backoff_sec = 2 ** min(current_attempt, 4)  # 2, 4, 8, 16s
+                    await self.log_app(app_id, f"Backing off for {backoff_sec}s before retry attempt {current_attempt + 1} on '{ans_lbl}'...")
+                    await asyncio.sleep(backoff_sec)
+
                 el = None
                 # A. Try exact CSS ID
                 if ans_field_id and not any(c in ans_field_id for c in [" ", ":", ">", "/", "[", "]"]):
@@ -341,6 +355,8 @@ class ApplyMateWorker:
 
                 if exec_res.success and exec_res.verification_passed:
                     applied_count += 1
+                    # Reset attempt counter on success
+                    app_attempts_map[q_key] = 0
                     # Store the verified option text rather than unverified user input
                     verified_text = str(exec_res.verified_value if exec_res.verified_value is not None else ans_val)
                     await self.log_app(app_id, f"Verified answer for '{ans_lbl}': '{verified_text}'")
@@ -380,8 +396,9 @@ class ApplyMateWorker:
                                 print(f"[Worker] Failed to save answer to memory: {save_err}")
                 else:
                     err_msg = exec_res.error or "Verification check failed after fill"
-                    attempts = ans_item.get("attempts", 0) + 1
-                    ans_item["attempts"] = attempts
+                    current_attempt += 1
+                    app_attempts_map[q_key] = current_attempt
+                    ans_item["attempts"] = current_attempt
                     ans_item["last_error"] = err_msg
                     ans_item["verification_failed"] = True
 
@@ -391,7 +408,7 @@ class ApplyMateWorker:
                         ans_item["needs_manual_confirmation"] = True
                         await self.log_app(app_id, f"[Combobox Unverified] Option clicked for '{ans_lbl}', but displayed value is unreadable in DOM. Flagged for manual confirmation.")
                     else:
-                        await self.log_app(app_id, f"[Verification Failed] (Attempt {attempts}/3) Value check failed for '{ans_lbl}': {err_msg}.")
+                        await self.log_app(app_id, f"[Verification Failed] (Attempt {current_attempt}/3) Value check failed for '{ans_lbl}': {err_msg}.")
                     remaining_batch.append(ans_item)
 
             saved_answers = get_saved_answers()
@@ -404,16 +421,21 @@ class ApplyMateWorker:
                 unverified_items = [item for item in remaining_batch if item.get("unverified")]
                 screenshot = await self.capture_screenshot(page)
                 if exhausted:
-                    ex_lbl = exhausted[0].get("label") or "Question"
-                    ex_err = exhausted[0].get("last_error") or "Verification failed"
-                    pause_msg = f"Paused: 3 failed attempts to verify '{ex_lbl}' ({ex_err}). Please check the browser on your laptop."
-                    await self.log_app(app_id, f"[Circuit Breaker] {pause_msg}")
+                    ex_item = exhausted[0]
+                    ex_lbl = ex_item.get("label") or "Question"
+                    ex_err = ex_item.get("last_error") or "Verification failed"
+                    ex_item["manual_required"] = True
+                    pause_msg = f"Needs attention: 3 failed attempts to verify '{ex_lbl}' ({ex_err}). Field marked manual_required. Please review in the visible browser and click Resume."
+                    await self.log_app(app_id, f"[Needs Attention] {pause_msg}")
+
+                    # Filter out the exhausted item so other fields can continue if resumed, but mark application paused for attention
+                    unanswered_remaining = [item for item in remaining_batch if not item.get("manual_required")]
                     update_application(app_id, {
-                        "status": "paused",
+                        "status": "paused",  # Needs attention state where user can fix in browser and click Resume
                         "batch_answers": [],
                         "user_answer": None,
-                        "unanswered_questions": remaining_batch,
-                        "unanswered_question": remaining_batch[0],
+                        "unanswered_questions": unanswered_remaining,
+                        "unanswered_question": ex_item,
                         "stage_message": pause_msg,
                         "review_screenshot_url": screenshot,
                         "form_data": persisted_form_data
@@ -423,7 +445,7 @@ class ApplyMateWorker:
                 # If option click succeeded but value is unverified in DOM, flag for manual confirmation instead of looping
                 if unverified_items:
                     u_lbl = unverified_items[0].get("label") or "Field"
-                    u_msg = f"Field '{u_lbl}' option was selected, but displayed value could not be confirmed in DOM. Flagged for manual confirmation."
+                    u_msg = f"Needs attention: Field '{u_lbl}' option was clicked, but displayed value could not be confirmed in DOM. Please confirm in the browser and click Resume."
                     await self.log_app(app_id, f"[Manual Confirmation Required] {u_msg}")
                     update_application(app_id, {
                         "status": "needs_input",
@@ -504,9 +526,20 @@ class ApplyMateWorker:
 
             await self.log_app(app_id, f"Collected batch of {len(q_batch)} question(s) requiring your confirmation. First: '{first_q.get('label')}'.")
 
-            # Deliver notification to Telegram if configured
+            # Deliver notification to Telegram if configured (deduped by hash of question keys)
             try:
-                send_batch_questions_to_telegram(company_name, "Job Application", q_batch, app_id)
+                batch_keys = []
+                for q in q_batch:
+                    k = q.get("key") or q.get("field_id") or q.get("label", "")
+                    batch_keys.append(str(k).strip().lower())
+                batch_hash = hashlib.sha256("|".join(sorted(batch_keys)).encode("utf-8")).hexdigest()
+
+                last_hash = self.last_telegram_batch_hash.get(app_id)
+                if last_hash != batch_hash:
+                    self.last_telegram_batch_hash[app_id] = batch_hash
+                    send_batch_questions_to_telegram(company_name, "Job Application", q_batch, app_id)
+                else:
+                    print(f"[Worker] Telegram notification skipped: identical question batch already sent for {app_id}.")
             except Exception as tg_err:
                 print(f"[Worker] Telegram notification error: {tg_err}")
 
