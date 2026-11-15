@@ -290,10 +290,10 @@ class ApplyMateWorker:
                     await asyncio.sleep(backoff_sec)
 
                 el = None
-                # A. Try exact CSS ID
-                if ans_field_id and not any(c in ans_field_id for c in [" ", ":", ">", "/", "[", "]"]):
+                # A. Try exact CSS ID using [id="..."] attribute selector
+                if ans_field_id:
                     try:
-                        el = await ctx.query_selector(f"#{ans_field_id}")
+                        el = await ctx.query_selector(f'[id="{ans_field_id}"]')
                     except Exception:
                         el = None
                 # B. Try exact name attribute
@@ -312,7 +312,7 @@ class ApplyMateWorker:
                             if l_txt == ans_lbl_clean or ans_lbl_clean in l_txt:
                                 for_attr = await l_el.get_attribute("for")
                                 if for_attr:
-                                    el = await ctx.query_selector(f"#{for_attr}")
+                                    el = await ctx.query_selector(f'[id="{for_attr}"]')
                                     if el:
                                         break
                     except Exception:
@@ -660,7 +660,7 @@ class ApplyMateWorker:
                 target_el = None
                 if field_id:
                     try:
-                        target_el = await ctx.query_selector(f"#{field_id}") or await ctx.query_selector(f'[name="{field_id}"]')
+                        target_el = await ctx.query_selector(f'[id="{field_id}"]') or await ctx.query_selector(f'[name="{field_id}"]')
                     except Exception:
                         target_el = None
                 if not target_el and ans_lbl:

@@ -60,10 +60,20 @@ def parse_date_value(val: Any, preferred_format: Optional[str] = None) -> Option
 
     return None
 
-def format_date_for_element(d: date, inp_type: str, placeholder: str) -> str:
-    """Format date according to element type and placeholder hint (dd/mm/yyyy, mm/dd/yyyy, yyyy-mm-dd, MMM yyyy)."""
-    ph = (placeholder or "").strip().lower()
+def format_date_for_element(
+    d: date,
+    inp_type: str = "",
+    placeholder: str = "",
+    pattern: str = "",
+    data_format: str = "",
+    aria_label: str = ""
+) -> str:
+    """
+    Format date according to explicit element hints (placeholder, pattern, data-format, aria-label, or input type).
+    If no format hint is present, outputs standard ISO YYYY-MM-DD instead of guessing DD/MM/YYYY.
+    """
     inp_t = (inp_type or "").strip().lower()
+    hints = " ".join([placeholder or "", pattern or "", data_format or "", aria_label or ""]).strip().lower()
 
     # 1. Native inputs
     if inp_t == "date":
@@ -71,34 +81,34 @@ def format_date_for_element(d: date, inp_type: str, placeholder: str) -> str:
     if inp_t == "month":
         return f"{d.year:04d}-{d.month:02d}"
 
-    # 2. 3-part date formats (must be evaluated before 2-part to prevent mm/yyyy matching within dd/mm/yyyy)
-    if re.search(r'\bmm[/-]dd[/-]yyyy\b', ph) or re.search(r'\bm[/-]d[/-]y\b', ph):
-        sep = "/" if "/" in ph else "-"
+    # 2. 3-part date formats with explicit hints
+    if re.search(r'\bmm[/-]dd[/-]yyyy\b', hints) or re.search(r'\bm[/-]d[/-]y\b', hints):
+        sep = "/" if "/" in hints else "-"
         return f"{d.month:02d}{sep}{d.day:02d}{sep}{d.year:04d}"
 
-    if re.search(r'\bdd[/-]mm[/-]yyyy\b', ph) or re.search(r'\bd[/-]m[/-]y\b', ph):
-        sep = "/" if "/" in ph else "-"
+    if re.search(r'\bdd[/-]mm[/-]yyyy\b', hints) or re.search(r'\bd[/-]m[/-]y\b', hints):
+        sep = "/" if "/" in hints else "-"
         return f"{d.day:02d}{sep}{d.month:02d}{sep}{d.year:04d}"
 
-    if re.search(r'\byyyy[/-]mm[/-]dd\b', ph):
-        sep = "-" if "-" in ph else "/"
+    if re.search(r'\byyyy[/-]mm[/-]dd\b', hints):
+        sep = "-" if "-" in hints else "/"
         return f"{d.year:04d}{sep}{d.month:02d}{sep}{d.day:02d}"
 
-    # 3. 2-part month-year formats (only if "day" or "dd" is NOT in placeholder)
-    if not re.search(r'(\bdd\b|\bd\b|day)', ph):
-        if re.search(r'\b(mmm\s*yyyy|month\s*yyyy|month,\s*year)\b', ph) or ph in ["mmm yyyy", "month yyyy"]:
+    # 3. 2-part month-year formats (only if "day" or "dd" is NOT in hints)
+    if not re.search(r'(\bdd\b|\bd\b|day)', hints):
+        if re.search(r'\b(mmm\s*yyyy|month\s*yyyy|month,\s*year)\b', hints) or hints in ["mmm yyyy", "month yyyy"]:
             return f"{d.strftime('%B')} {d.year:04d}"
 
-        if re.search(r'\bmm[/-]yyyy\b', ph):
-            sep = "/" if "/" in ph else "-"
+        if re.search(r'\bmm[/-]yyyy\b', hints):
+            sep = "/" if "/" in hints else "-"
             return f"{d.month:02d}{sep}{d.year:04d}"
 
-        if re.search(r'\byyyy[/-]mm\b', ph):
-            sep = "-" if "-" in ph else "/"
+        if re.search(r'\byyyy[/-]mm\b', hints):
+            sep = "-" if "-" in hints else "/"
             return f"{d.year:04d}{sep}{d.month:02d}"
 
-    # Default to standard DD/MM/YYYY
-    return f"{d.day:02d}/{d.month:02d}/{d.year:04d}"
+    # Default to unambiguous ISO YYYY-MM-DD if no hint exists
+    return f"{d.year:04d}-{d.month:02d}-{d.day:02d}"
 
 class WidgetType:
     TEXT = "text"
@@ -225,10 +235,12 @@ class TextWidgetExecutor(BaseWidgetExecutor):
         val_str = str(value).strip()
         inp_type = (await element.get_attribute("type") or "text").lower()
 
-        # Numeric inputs: extract digits/decimals
+        # Numeric inputs: extract digits/decimals. If no digits found, return False instead of inventing "0"
         if inp_type == "number":
             num_match = re.search(r'\d+(?:\.\d+)?', val_str)
-            val_str = num_match.group(0) if num_match else "0"
+            if not num_match:
+                return False
+            val_str = num_match.group(0)
 
         # Check for masked placeholders (e.g. phone masks (___) ___-____)
         placeholder = (await element.get_attribute("placeholder") or "").lower()
@@ -285,15 +297,22 @@ class TextWidgetExecutor(BaseWidgetExecutor):
         except ValueError:
             pass
 
-        # Masked / cleaned phone digits match
+        # Masked / cleaned phone digits match:
+        # Require either exact digit equality, or the expected digits ending with read digits (with at least 7 digits)
         curr_digits = re.sub(r'\D', '', curr_clean)
         exp_digits = re.sub(r'\D', '', exp_clean)
-        if curr_digits and exp_digits and (curr_digits in exp_digits or exp_digits in curr_digits):
-            return True, curr_clean
+        if curr_digits and exp_digits:
+            if curr_digits == exp_digits:
+                return True, curr_clean
+            if len(curr_digits) >= 7 and exp_digits.endswith(curr_digits):
+                return True, curr_clean
+            if len(exp_digits) >= 7 and curr_digits.endswith(exp_digits):
+                return True, curr_clean
 
-        # Substring match (e.g. for long bio or formatted values)
-        if exp_clean in curr_clean or curr_clean in exp_clean:
-            return True, curr_clean
+        # Substring match: only for longer text (e.g. bio, summaries, >= 20 chars) to prevent short truncated values passing
+        if len(exp_clean) >= 20 and len(curr_clean) >= 20:
+            if exp_clean in curr_clean or curr_clean in exp_clean:
+                return True, curr_clean
 
         return False, curr_clean
 
@@ -684,9 +703,9 @@ class CustomComboboxWidgetExecutor(BaseWidgetExecutor):
 
         if listbox_id:
             try:
-                listbox = await ctx.query_selector(f"#{listbox_id}")
+                listbox = await ctx.query_selector(f'[id="{listbox_id}"]')
                 if not listbox and hasattr(page, "query_selector"):
-                    listbox = await page.query_selector(f"#{listbox_id}")
+                    listbox = await page.query_selector(f'[id="{listbox_id}"]')
             except Exception:
                 listbox = None
 
@@ -709,7 +728,7 @@ class CustomComboboxWidgetExecutor(BaseWidgetExecutor):
                 await input_el.click(timeout=1000)
                 await asyncio.sleep(0.1)
                 if not listbox and listbox_id:
-                    listbox = await ctx.query_selector(f"#{listbox_id}")
+                    listbox = await ctx.query_selector(f'[id="{listbox_id}"]')
                 if not listbox:
                     listbox = await ctx.query_selector('.select__menu, [role="listbox"], .select2-results__options, [class*="MuiAutocomplete-popper"] [role="listbox"], [class*="MuiAutocomplete-listbox"]')
             except Exception:
@@ -1064,9 +1083,14 @@ class DateWidgetExecutor(BaseWidgetExecutor):
 
         inp_type = (await element.get_attribute("type") or "").lower()
         ph = (await element.get_attribute("placeholder") or "").lower()
+        pat = (await element.get_attribute("pattern") or "").lower()
+        df = (await element.get_attribute("data-format") or "").lower()
+        aria = (await element.get_attribute("aria-label") or "").lower()
 
-        # Format date according to detected format from placeholder and element type
-        formatted_val = format_date_for_element(parsed_d, inp_type, ph)
+        # Format date according to detected format from hints and element type
+        formatted_val = format_date_for_element(
+            parsed_d, inp_type=inp_type, placeholder=ph, pattern=pat, data_format=df, aria_label=aria
+        )
 
         # Remove readonly if present on calendar inputs
         await element.evaluate("el => el.removeAttribute('readonly')")
@@ -1093,7 +1117,12 @@ class DateWidgetExecutor(BaseWidgetExecutor):
             return
         inp_type = (await element.get_attribute("type") or "").lower()
         ph = (await element.get_attribute("placeholder") or "").lower()
-        formatted_val = format_date_for_element(parsed_d, inp_type, ph)
+        pat = (await element.get_attribute("pattern") or "").lower()
+        df = (await element.get_attribute("data-format") or "").lower()
+        aria = (await element.get_attribute("aria-label") or "").lower()
+        formatted_val = format_date_for_element(
+            parsed_d, inp_type=inp_type, placeholder=ph, pattern=pat, data_format=df, aria_label=aria
+        )
 
         await element.evaluate("""(el, val) => {
             try {
@@ -1113,7 +1142,7 @@ class DateWidgetExecutor(BaseWidgetExecutor):
         }""", formatted_val)
 
     async def verify(self, ctx: Union[Page, Frame], element: ElementHandle, expected_value: Any, **kwargs) -> Tuple[bool, Optional[str]]:
-        """Re-reads the actual date value from the input and compares parsed dates rather than just the year."""
+        """Re-reads the actual date value from the input and compares parsed dates with format awareness."""
         current_val = await element.input_value()
         curr_clean = (current_val or "").strip()
         if not curr_clean:
@@ -1123,19 +1152,33 @@ class DateWidgetExecutor(BaseWidgetExecutor):
 
         inp_type = (await element.get_attribute("type") or "").lower()
         ph = (await element.get_attribute("placeholder") or "").lower()
+        pat = (await element.get_attribute("pattern") or "").lower()
+        df = (await element.get_attribute("data-format") or "").lower()
+        aria = (await element.get_attribute("aria-label") or "").lower()
+        hints = f"{ph} {pat} {df} {aria}".strip()
 
         preferred_fmt = None
-        if "mm/dd" in ph:
-            preferred_fmt = "%m/%d/%Y"
-        elif "mm-dd" in ph:
-            preferred_fmt = "%m-%d-%Y"
-        elif "dd/mm" in ph:
-            preferred_fmt = "%d/%m/%Y"
-        elif "dd-mm" in ph:
-            preferred_fmt = "%d-%m-%Y"
+        if re.search(r'\bmm[/-]dd[/-]yyyy\b', hints) or re.search(r'\bm[/-]d[/-]y\b', hints):
+            preferred_fmt = "%m/%d/%Y" if "/" in curr_clean else "%m-%d-%Y"
+        elif re.search(r'\bdd[/-]mm[/-]yyyy\b', hints) or re.search(r'\bd[/-]m[/-]y\b', hints):
+            preferred_fmt = "%d/%m/%Y" if "/" in curr_clean else "%d-%m-%Y"
+        elif re.search(r'\byyyy[/-]mm[/-]dd\b', hints) or inp_type == "date":
+            preferred_fmt = "%Y-%m-%d" if "-" in curr_clean else "%Y/%m/%d"
+        elif inp_type == "month" or re.search(r'\byyyy[/-]mm\b', hints):
+            preferred_fmt = "%Y-%m"
 
         exp_d = parse_date_value(expected_value, preferred_format=preferred_fmt)
-        curr_d = parse_date_value(curr_clean, preferred_format=preferred_fmt)
+
+        # Parse current value strictly respecting preferred format to catch swapped day and month
+        curr_d = None
+        if preferred_fmt:
+            try:
+                curr_d = datetime.strptime(curr_clean, preferred_fmt).date()
+            except ValueError:
+                curr_d = None
+        if not curr_d:
+            # If no format hint was available, and current string is formatted, attempt unambiguous parse
+            curr_d = parse_date_value(curr_clean)
 
         if not exp_d or not curr_d:
             # If standard parsing fails, fallback to exact string check
@@ -1143,9 +1186,7 @@ class DateWidgetExecutor(BaseWidgetExecutor):
                 return True, curr_clean
             return False, curr_clean
 
-        inp_type = (await element.get_attribute("type") or "").lower()
-        ph = (await element.get_attribute("placeholder") or "").lower()
-        is_month_year = (inp_type == "month") or bool(re.search(r'\b(mmm\s*yyyy|month\s*yyyy|mm/yyyy|yyyy-mm)\b', ph, re.I))
+        is_month_year = (inp_type == "month") or bool(re.search(r'\b(mmm\s*yyyy|month\s*yyyy|mm/yyyy|yyyy-mm)\b', hints, re.I))
 
         if is_month_year:
             # For month-year inputs, compare year and month
@@ -1415,7 +1456,7 @@ async def verify_filled_widgets(
         if selector:
             el = await ctx.query_selector(selector)
         if not el and el_id:
-            el = await ctx.query_selector(f"#{el_id}")
+            el = await ctx.query_selector(f'[id="{el_id}"]')
         if not el and name:
             el = await ctx.query_selector(f'[name="{name}"]')
 

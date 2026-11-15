@@ -384,7 +384,7 @@ async def get_element_label(ctx, el: ElementHandle) -> str:
         if aria_labelledby:
             parts = []
             for lid in aria_labelledby.split():
-                lbl_target = await ctx.query_selector(f'#{lid}')
+                lbl_target = await ctx.query_selector(f'[id="{lid}"]')
                 if lbl_target:
                     txt = (await lbl_target.inner_text() or "").strip()
                     if txt and not any(skip in txt.lower() for skip in ["error", "required", "select..."]):
@@ -611,33 +611,6 @@ class RestoreResult:
     def all_passed(self) -> bool:
         return len(self.failed_fields) == 0
 
-    def __int__(self) -> int:
-        return self.restored_count
-
-    def __index__(self) -> int:
-        return self.restored_count
-
-    def __bool__(self) -> bool:
-        return self.restored_count > 0
-
-    def __str__(self) -> str:
-        return str(self.restored_count)
-
-    def __gt__(self, other) -> bool:
-        return self.restored_count > (int(other) if not isinstance(other, int) else other)
-
-    def __ge__(self, other) -> bool:
-        return self.restored_count >= (int(other) if not isinstance(other, int) else other)
-
-    def __lt__(self, other) -> bool:
-        return self.restored_count < (int(other) if not isinstance(other, int) else other)
-
-    def __le__(self, other) -> bool:
-        return self.restored_count <= (int(other) if not isinstance(other, int) else other)
-
-    def __eq__(self, other) -> bool:
-        return self.restored_count == (int(other) if not isinstance(other, int) else other)
-
 async def fast_restore_form_data(
     ctx,
     form_data: Dict[str, Any],
@@ -686,7 +659,7 @@ async def fast_restore_form_data(
 
             if not el and f_id:
                 try:
-                    el = await ctx.query_selector(f"#{f_id}")
+                    el = await ctx.query_selector(f'[id="{f_id}"]')
                 except Exception:
                     el = None
 
@@ -706,7 +679,7 @@ async def fast_restore_form_data(
                         if l_txt == f_lbl_clean or f_lbl_clean in l_txt:
                             for_attr = await l_el.get_attribute("for")
                             if for_attr:
-                                el = await ctx.query_selector(f"#{for_attr}")
+                                el = await ctx.query_selector(f'[id="{for_attr}"]')
                                 if el:
                                     break
                 except Exception:
@@ -775,8 +748,6 @@ async def fast_restore_form_data(
         verified_fields=verified_fields,
         failed_fields=failed_fields
     )
-
-    return restored_count
 
 async def fill_form_on_page(
     page: Page,
@@ -906,14 +877,14 @@ async def fill_form_on_page(
             tag = await el.evaluate("e => e.tagName.toLowerCase()")
             inp_type = (await el.get_attribute("type") or "").lower()
             role = (await el.get_attribute("role") or "").lower()
-            el_id = (await el.get_attribute("id") or "").lower()
+            el_id = await el.get_attribute("id") or ""
             name = await el.get_attribute("name") or ""
             el_class = (await el.get_attribute("class") or "").lower()
 
             # Filter non-input / non-interactive buttons
             if inp_type in ["submit", "button", "reset", "hidden"] and inp_type != "file":
                 continue
-            if "search-input" in el_id or "iti-" in el_id or "select2-selection" in el_class or "recaptcha" in el_id:
+            if "search-input" in el_id.lower() or "iti-" in el_id.lower() or "select2-selection" in el_class or "recaptcha" in el_id.lower():
                 continue
 
             # Elements must be visible unless file input or select (Select2 hides native selects)
@@ -975,10 +946,10 @@ async def fill_form_on_page(
                                 "type": "file",
                                 "id": el_id,
                                 "name": name,
-                                "selector": f"#{el_id}" if el_id else "",
+                                "selector": f'[id="{el_id}"]' if el_id else "",
                                 "verified": exec_res.verified_value
                             })
-                            record_filled(el_id, name, label or "Resume Upload", tag, "file", resume_path, selector=f"#{el_id}" if el_id else "")
+                            record_filled(el_id, name, label or "Resume Upload", tag, "file", resume_path, selector=f'[id="{el_id}"]' if el_id else "")
                     except Exception as e:
                         print(f"File upload error on '{label}': {e}")
                 continue
@@ -1022,10 +993,10 @@ async def fill_form_on_page(
                             "type": "combobox",
                             "id": el_id,
                             "name": name,
-                            "selector": f"#{el_id}" if el_id else "",
+                            "selector": f'[id="{el_id}"]' if el_id else "",
                             "verified": exec_res.verified_value
                         })
-                        record_filled(el_id, name, label, tag, "combobox", val_str, selector=f"#{el_id}" if el_id else "")
+                        record_filled(el_id, name, label, tag, "combobox", val_str, selector=f'[id="{el_id}"]' if el_id else "")
                         continue
 
                 # B. Location / City typeahead
@@ -1050,10 +1021,10 @@ async def fill_form_on_page(
                             "type": "combobox",
                             "id": el_id,
                             "name": name,
-                            "selector": f"#{el_id}" if el_id else "",
+                            "selector": f'[id="{el_id}"]' if el_id else "",
                             "verified": exec_res.verified_value
                         })
-                        record_filled(el_id, name, label, tag, "combobox", val_str, selector=f"#{el_id}" if el_id else "")
+                        record_filled(el_id, name, label, tag, "combobox", val_str, selector=f'[id="{el_id}"]' if el_id else "")
                         continue
 
                 # C. Extract options & check saved answers (memory) and non-sensitive deterministic rules
@@ -1067,14 +1038,14 @@ async def fill_form_on_page(
                         await asyncio.sleep(0.4)
 
                         aria_controls = await el.get_attribute("aria-controls")
-                        listbox = await ctx.query_selector(f"#{aria_controls}") if aria_controls else None
+                        listbox = await ctx.query_selector(f'[id="{aria_controls}"]') if aria_controls else None
                         if not listbox and aria_controls:
-                            listbox = await page.query_selector(f"#{aria_controls}")
+                            listbox = await page.query_selector(f'[id="{aria_controls}"]')
                         if not listbox:
                             aria_owns = await el.get_attribute("aria-owns")
-                            listbox = await ctx.query_selector(f"#{aria_owns}") if aria_owns else None
+                            listbox = await ctx.query_selector(f'[id="{aria_owns}"]') if aria_owns else None
                             if not listbox and aria_owns:
-                                listbox = await page.query_selector(f"#{aria_owns}")
+                                listbox = await page.query_selector(f'[id="{aria_owns}"]')
                         if not listbox:
                             listbox = await ctx.query_selector('.select__menu:not([class*="control"]), [role="listbox"]:not(.iti__country-list):not([class*="iti"]), [class*="MuiAutocomplete-popper"], [class*="ant-select-dropdown"]') or await page.query_selector('.select__menu:not([class*="control"]), [role="listbox"]:not(.iti__country-list):not([class*="iti"]), [class*="MuiAutocomplete-popper"], [class*="ant-select-dropdown"]')
 
@@ -1101,10 +1072,10 @@ async def fill_form_on_page(
                             "type": "combobox",
                             "id": el_id,
                             "name": name,
-                            "selector": f"#{el_id}" if el_id else "",
+                            "selector": f'[id="{el_id}"]' if el_id else "",
                             "verified": exec_res.verified_value
                         })
-                        record_filled(el_id, name, label, tag, "combobox", str(matched_val))
+                        record_filled(el_id, name, label, tag, "combobox", str(matched_val), selector=f'[id="{el_id}"]' if el_id else "")
                         continue
 
                 await page.keyboard.press("Escape")
@@ -1251,10 +1222,10 @@ async def fill_form_on_page(
                             "type": "select",
                             "id": el_id,
                             "name": name,
-                            "selector": f"#{el_id}" if el_id else "",
+                            "selector": f'[id="{el_id}"]' if el_id else "",
                             "verified": exec_res.verified_value
                         })
-                        record_filled(el_id, name, label, tag, "select", str(matched_val))
+                        record_filled(el_id, name, label, tag, "select", str(matched_val), selector=f'[id="{el_id}"]' if el_id else "")
                         continue
 
                 # D. Pause for unconfirmed select dropdown -> Collect into batch
@@ -1353,10 +1324,10 @@ async def fill_form_on_page(
                             "type": "checkbox",
                             "id": el_id,
                             "name": name,
-                            "selector": f"#{el_id}" if el_id else "",
+                            "selector": f'[id="{el_id}"]' if el_id else "",
                             "verified": exec_res.verified_value
                         })
-                        record_filled(el_id, name, checkbox_label, "input", "checkbox", "Yes")
+                        record_filled(el_id, name, checkbox_label, "input", "checkbox", "Yes", selector=f'[id="{el_id}"]' if el_id else "")
                         continue
 
                 # Pause on consent / agreement / required checkboxes -> Collect into batch
@@ -1396,10 +1367,10 @@ async def fill_form_on_page(
                             "type": "date",
                             "id": el_id,
                             "name": name,
-                            "selector": f"#{el_id}" if el_id else "",
+                            "selector": f'[id="{el_id}"]' if el_id else "",
                             "verified": exec_res.verified_value
                         })
-                        record_filled(el_id, name, label, tag, "date", str(matched_val))
+                        record_filled(el_id, name, label, tag, "date", str(matched_val), selector=f'[id="{el_id}"]' if el_id else "")
                         continue
 
                 # Prompt user with HTML5 interactive datepicker -> Collect into batch
@@ -1459,10 +1430,10 @@ async def fill_form_on_page(
                             "type": "text",
                             "id": el_id,
                             "name": name,
-                            "selector": f"#{el_id}" if el_id else "",
+                            "selector": f'[id="{el_id}"]' if el_id else "",
                             "verified": exec_res.verified_value
                         })
-                        record_filled(el_id, name, label, tag, inp_type or "text", str(matched_value), selector=f"#{el_id}" if el_id else "")
+                        record_filled(el_id, name, label, tag, inp_type or "text", str(matched_value), selector=f'[id="{el_id}"]' if el_id else "")
                         continue
 
                 # Skip optional notes
