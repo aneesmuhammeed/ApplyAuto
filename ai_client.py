@@ -119,13 +119,19 @@ async def call_qwen(
     prompt: str,
     system_prompt: str = "You are an intelligent, factual job application assistant. You strictly use candidate facts without inventing qualifications. Keep answers concise.",
     max_tokens: int = 400,
-    timeout: float = 20.0
+    timeout: float = 20.0,
+    response_format: Optional[Dict[str, Any]] = None
 ) -> Optional[str]:
     """
     Call local LLM server running Qwen with configurable endpoint and model name.
-    Handles thinking tags, reasoning_content, and formatted system instruction.
+    Appends /no_think to user prompt to suppress Qwen3 thinking tokens.
+    Sets temperature: 0.0 for deterministic evaluation.
+    Strips any <think>...</think> blocks before returning.
+    Optionally passes response_format for structured JSON schema outputs if supported.
     """
     clean_prompt = prompt.strip()
+    if not clean_prompt.endswith("/no_think"):
+        clean_prompt = f"{clean_prompt}\n/no_think"
 
     endpoint = settings.LLM_ENDPOINT
     model_name = settings.LLM_MODEL
@@ -136,10 +142,13 @@ async def call_qwen(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": clean_prompt}
         ],
-        "temperature": 0.1,
+        "temperature": 0.0,
         "max_tokens": max_tokens,
         "stream": False
     }
+
+    if response_format:
+        payload["response_format"] = response_format
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -150,7 +159,7 @@ async def call_qwen(
                 content = (msg.get("content") or "").strip()
                 reasoning = (msg.get("reasoning_content") or "").strip()
 
-                # Clean think tag artifacts
+                # Clean think tag artifacts (DOTALL)
                 content = re.sub(r'<think>[\s\S]*?</think>', '', content, flags=re.DOTALL).strip()
 
                 # If content is empty or incomplete but reasoning_content contains a decision/JSON, fallback to reasoning
@@ -160,6 +169,18 @@ async def call_qwen(
                         return clean_reasoning
 
                 return content
+            elif resp.status_code == 400 and response_format and "response_format" in resp.text:
+                # If llama-server version does not support response_format, retry without it
+                payload.pop("response_format", None)
+                async with httpx.AsyncClient(timeout=timeout) as retry_client:
+                    retry_resp = await retry_client.post(endpoint, json=payload)
+                    if retry_resp.status_code == 200:
+                        retry_data = retry_resp.json()
+                        retry_msg = retry_data["choices"][0]["message"]
+                        retry_content = (retry_msg.get("content") or "").strip()
+                        return re.sub(r'<think>[\s\S]*?</think>', '', retry_content, flags=re.DOTALL).strip()
+                    print(f"[Local AI] Retry without response_format failed ({retry_resp.status_code}): {retry_resp.text}")
+                    return None
             else:
                 print(f"[Local AI] Non-200 response from {endpoint}: {resp.status_code} - {resp.text}")
                 return None
@@ -363,6 +384,23 @@ async def ai_generate_tailored_answer(
     # OPTION CHOICE PATH (JSON with option_index & confidence)
     # =========================================================================
     if options:
+        # If options list is huge (> 30), first try deterministic matching against candidate profile
+        if len(options) > 30:
+            from field_rules import get_field_match_by_rules
+            rule_match = get_field_match_by_rules(clean_q, candidate_profile)
+            if rule_match:
+                from widget_executors import match_option_candidate
+                matched_cand, score = match_option_candidate(str(rule_match), options)
+                if matched_cand and score >= 0.70:
+                    print(f"[Option Pruning] Resolved large option list ({len(options)} options) deterministically for '{clean_q}': '{matched_cand}' (score: {score:.2f})")
+                    set_cached_llm_result(cache_key, "choice", matched_cand)
+                    return matched_cand
+
+            # If deterministic matching fails on large options list, ask the user directly
+            print(f"[Option Pruning] Option list too large ({len(options)} options) and deterministic profile matching failed for '{clean_q}'. Asking user.")
+            set_cached_llm_result(cache_key, "choice", "__ASK_USER__")
+            return None
+
         trimmed_options = prune_options_for_prompt(options, candidate_profile, max_options=12)
         compact_facts = extract_compact_profile_facts(candidate_profile)
 
@@ -377,14 +415,26 @@ Available Options:
 
 Task: Choose the single best option matching the candidate facts.
 Respond with JSON:
-{{"option_index": <int 0 to {len(trimmed_options) - 1}>, "confidence": <float 0.0 to 1.0>, "reason": "<short explanation>"}}
+{{"index": <int 0 to {len(trimmed_options) - 1}>, "confidence": <float 0.0 to 1.0>}}
 """
         system_prompt = "You are a factual form option evaluator. Output strictly a valid JSON object."
         print(f"[Local AI Prompt] Asking Qwen option choice for: '{clean_q[:70]}'")
 
-        resp = await call_qwen(prompt, system_prompt=system_prompt, max_tokens=400, timeout=20.0)
+        response_format_schema = {
+            "type": "json_object",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "confidence": {"type": "number"}
+                },
+                "required": ["index", "confidence"]
+            }
+        }
+
+        resp = await call_qwen(prompt, system_prompt=system_prompt, max_tokens=150, timeout=20.0, response_format=response_format_schema)
         if not resp:
-            print(f"[Local AI Decision] Timeout or failure calling LLM for '{clean_q}'. Asking user.")
+            print(f"[Local AI Decision] Timeout or failure calling LLM for '{clean_q}'. Raw output was empty/None. Asking user.")
             set_cached_llm_result(cache_key, "choice", "__ASK_USER__")
             return None
 
@@ -394,11 +444,13 @@ Respond with JSON:
 
         data = None
         # Try JSON extraction
-        m = re.search(r'\{[\s\S]*?"option_index"[\s\S]*?\}', clean_resp)
+        m = re.search(r'\{[\s\S]*?"index"[\s\S]*?\}', clean_resp)
+        if not m:
+            m = re.search(r'\{[\s\S]*?"option_index"[\s\S]*?\}', clean_resp)
         if not m:
             m = re.search(r'\{[\s\S]*?\}', clean_resp)
         if not m:
-            m = re.search(r'\{[\s\S]*?"option_index"[\s\S]*?\}', resp)
+            m = re.search(r'\{[\s\S]*?"index"[\s\S]*?\}', resp)
 
         if m:
             json_str = m.group(0)
@@ -415,37 +467,37 @@ Respond with JSON:
         # Robust regex fallback
         if not data or not isinstance(data, dict):
             target_str = clean_resp if clean_resp else resp
-            idx_m = re.search(r'"?option_index"?\s*:\s*(-?\d+)', target_str)
+            idx_m = re.search(r'"?index"?\s*:\s*(-?\d+)', target_str)
+            if not idx_m:
+                idx_m = re.search(r'"?option_index"?\s*:\s*(-?\d+)', target_str)
             if not idx_m:
                 idx_m = re.search(r'(?:option|index|choice)\s*(?:index)?[\s":=]+(-?\d+)', target_str, re.I)
             conf_m = re.search(r'"?confidence"?\s*:\s*([0-9\.]+|"[^"]+")', target_str)
-            reason_m = re.search(r'"?reason"?\s*:\s*"([^"]+)"', target_str)
             if idx_m:
                 data = {
-                    "option_index": int(idx_m.group(1)),
-                    "confidence": conf_m.group(1) if conf_m else 0.8,
-                    "reason": reason_m.group(1) if reason_m else ""
+                    "index": int(idx_m.group(1)),
+                    "confidence": conf_m.group(1) if conf_m else 0.8
                 }
 
         if not data:
-            print(f"[Local AI Decision] Could not parse decision from: '{resp[:100]}'. Asking user.")
+            print(f"[Local AI Decision] Could not parse JSON decision from model for '{clean_q}'. Raw model output: {repr(resp)}. Asking user.")
             set_cached_llm_result(cache_key, "choice", "__ASK_USER__")
             return None
 
-        # Read option_index
-        opt_idx = data.get("option_index")
+        # Read index (supports both 'index' and 'option_index')
+        opt_idx = data.get("index")
         if opt_idx is None:
-            opt_idx = data.get("index")
+            opt_idx = data.get("option_index")
 
         try:
             opt_idx = int(opt_idx)
         except (ValueError, TypeError):
-            print(f"[Local AI Decision] Non-integer option_index '{opt_idx}'. Asking user.")
+            print(f"[Local AI Decision] Non-integer option index '{opt_idx}' for '{clean_q}'. Raw model output: {repr(resp)}. Asking user.")
             set_cached_llm_result(cache_key, "choice", "__ASK_USER__")
             return None
 
         if opt_idx < 0 or opt_idx >= len(trimmed_options):
-            print(f"[Local AI Decision] option_index {opt_idx} out of range [0, {len(trimmed_options)-1}]. Asking user.")
+            print(f"[Local AI Decision] Option index {opt_idx} out of range [0, {len(trimmed_options)-1}] for '{clean_q}'. Raw model output: {repr(resp)}. Asking user.")
             set_cached_llm_result(cache_key, "choice", "__ASK_USER__")
             return None
 

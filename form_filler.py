@@ -1115,9 +1115,11 @@ async def fill_form_on_page(
                 is_boolean_question = bool(re.search(r'^(are|do|will|have|is|can|should|would|did|was|were)\b|\b(yes\/no)\b', label.strip(), re.I))
 
                 if options:
-                    print(f"[AI Reasoning] Querying Qwen with options for '{label[:60]}...'")
-                    ai_decision = await ai_generate_tailored_answer(label, profile, job_context=job_context, options=options)
-                    print(f"[AI Decision] Qwen chose: '{ai_decision}' from {options}")
+                    ai_decision = ""
+                    if not is_sensitive_question(label):
+                        print(f"[AI Reasoning] Querying Qwen with options for '{label[:60]}...'")
+                        ai_decision = await ai_generate_tailored_answer(label, profile, job_context=job_context, options=options)
+                        print(f"[AI Decision] Qwen chose: '{ai_decision}' from {options[:5]}...")
 
                     collect_unanswered_question(
                         field_id=field_id,
@@ -1130,7 +1132,9 @@ async def fill_form_on_page(
                     continue
                 elif is_boolean_question:
                     fallback_options = ["Yes", "No"]
-                    ai_decision = await ai_generate_tailored_answer(label, profile, job_context=job_context, options=fallback_options)
+                    ai_decision = ""
+                    if not is_sensitive_question(label):
+                        ai_decision = await ai_generate_tailored_answer(label, profile, job_context=job_context, options=fallback_options)
                     collect_unanswered_question(
                         field_id=field_id,
                         label=label,
@@ -1141,13 +1145,15 @@ async def fill_form_on_page(
                     )
                     continue
                 else:
-                    ai_decision = await ai_generate_tailored_answer(label, profile, job_context=job_context) or ""
+                    ai_decision = ""
+                    if not is_sensitive_question(label):
+                        ai_decision = await ai_generate_tailored_answer(label, profile, job_context=job_context) or ""
                     collect_unanswered_question(
                         field_id=field_id,
                         label=label,
                         field_type="text",
                         options=[],
-                        ai_suggestion=ai_decision,
+                        ai_suggestion=ai_decision or "",
                         category="general"
                     )
                     continue
@@ -1253,7 +1259,7 @@ async def fill_form_on_page(
 
                 # D. Pause for unconfirmed select dropdown -> Collect into batch
                 ai_decision = ""
-                if opt_texts:
+                if opt_texts and not is_sensitive_question(label):
                     opt_texts_to_pass = opt_texts[:20]
                     ai_decision = await ai_generate_tailored_answer(label, profile, job_context=job_context, options=opt_texts_to_pass)
 
@@ -1310,7 +1316,9 @@ async def fill_form_on_page(
                         continue
 
                 # Pause on unknown radio group -> Collect into batch
-                ai_decision = await ai_generate_tailored_answer(group_label, profile, job_context=job_context, options=radio_options or ["Yes", "No"])
+                ai_decision = ""
+                if not is_sensitive_question(group_label):
+                    ai_decision = await ai_generate_tailored_answer(group_label, profile, job_context=job_context, options=radio_options or ["Yes", "No"])
                 field_id = await el.get_attribute("id") or name or group_label
                 collect_unanswered_question(
                     field_id=field_id,
