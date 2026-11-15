@@ -118,16 +118,14 @@ def clear_llm_cache(cache_type: Optional[str] = None):
 async def call_qwen(
     prompt: str,
     system_prompt: str = "You are an intelligent, factual job application assistant. You strictly use candidate facts without inventing qualifications. Keep answers concise.",
-    max_tokens: int = 150,
+    max_tokens: int = 400,
     timeout: float = 20.0
 ) -> Optional[str]:
     """
     Call local LLM server running Qwen with configurable endpoint and model name.
-    Uses /no_think for fast deterministic answers and formatted system instruction.
+    Handles thinking tags, reasoning_content, and formatted system instruction.
     """
     clean_prompt = prompt.strip()
-    if not clean_prompt.startswith("/no_think"):
-        clean_prompt = f"/no_think\n{clean_prompt}"
 
     endpoint = settings.LLM_ENDPOINT
     model_name = settings.LLM_MODEL
@@ -148,9 +146,19 @@ async def call_qwen(
             resp = await client.post(endpoint, json=payload)
             if resp.status_code == 200:
                 data = resp.json()
-                content = data["choices"][0]["message"]["content"].strip()
+                msg = data["choices"][0]["message"]
+                content = (msg.get("content") or "").strip()
+                reasoning = (msg.get("reasoning_content") or "").strip()
+
                 # Clean think tag artifacts
-                content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+                content = re.sub(r'<think>[\s\S]*?</think>', '', content, flags=re.DOTALL).strip()
+
+                # If content is empty or incomplete but reasoning_content contains a decision/JSON, fallback to reasoning
+                if (not content or not ('{' in content and '}' in content)) and reasoning:
+                    clean_reasoning = re.sub(r'<think>[\s\S]*?</think>', '', reasoning, flags=re.DOTALL).strip()
+                    if '{' in clean_reasoning:
+                        return clean_reasoning
+
                 return content
             else:
                 print(f"[Local AI] Non-200 response from {endpoint}: {resp.status_code} - {resp.text}")
@@ -232,6 +240,84 @@ async def ai_match_saved_answers(
 
     return None
 
+def extract_compact_profile_facts(candidate_profile: Dict[str, Any]) -> str:
+    """Build a concise, token-efficient profile snapshot for option choice evaluation."""
+    facts = []
+    if candidate_profile.get("full_name"):
+        facts.append(f"Candidate Name: {candidate_profile['full_name']}")
+    if candidate_profile.get("location"):
+        facts.append(f"Location: {candidate_profile['location']}")
+    if candidate_profile.get("country"):
+        facts.append(f"Country: {candidate_profile['country']}")
+    if candidate_profile.get("phone_code"):
+        facts.append(f"Phone Code: {candidate_profile['phone_code']}")
+    if candidate_profile.get("gender"):
+        facts.append(f"Gender: {candidate_profile['gender']}")
+    if candidate_profile.get("pronouns"):
+        facts.append(f"Pronouns: {candidate_profile['pronouns']}")
+    if candidate_profile.get("work_authorization"):
+        facts.append(f"Work Auth: {candidate_profile['work_authorization']}")
+    if candidate_profile.get("visa_sponsorship"):
+        facts.append(f"Visa Sponsorship: {candidate_profile['visa_sponsorship']}")
+    if candidate_profile.get("total_experience_years"):
+        facts.append(f"Total Experience: {candidate_profile['total_experience_years']} years")
+
+    # Skills: top 8 only
+    raw_skills = candidate_profile.get("skills", [])
+    if isinstance(raw_skills, list) and raw_skills:
+        facts.append(f"Top Skills: {', '.join([str(s) for s in raw_skills[:8]])}")
+    elif isinstance(raw_skills, str) and raw_skills:
+        facts.append(f"Top Skills: {raw_skills[:80]}")
+
+    # Education: degree only
+    raw_edu = candidate_profile.get("education", [])
+    if isinstance(raw_edu, list) and raw_edu:
+        first_edu = raw_edu[0]
+        deg = first_edu.get("degree") or first_edu.get("field_of_study") or "" if isinstance(first_edu, dict) else str(first_edu)
+        if deg:
+            facts.append(f"Education: {deg}")
+    elif isinstance(raw_edu, str) and raw_edu:
+        facts.append(f"Education: {raw_edu[:60]}")
+
+    summary = candidate_profile.get("summary", "")
+    if summary:
+        first_sent = summary.split(".")[0].strip()
+        if first_sent:
+            facts.append(f"Summary: {first_sent[:120]}")
+
+    return "\n".join(facts)
+
+def prune_options_for_prompt(
+    options: List[str],
+    candidate_profile: Dict[str, Any],
+    max_options: int = 12
+) -> List[str]:
+    """
+    Prune large option sets (e.g. 240 countries) to fit comfortably within LLM context window.
+    Prioritizes options matching candidate profile keywords (location, country, calling code, etc.).
+    """
+    if not options or len(options) <= max_options:
+        return options
+
+    keywords = set()
+    for field in ["country", "location", "preferred_location", "phone_code", "dial_code", "gender"]:
+        val = candidate_profile.get(field)
+        if val:
+            for tok in re.findall(r'[a-zA-Z0-9\+]+', str(val).lower()):
+                if len(tok) >= 2:
+                    keywords.add(tok)
+
+    keywords.update(["yes", "no", "authorized", "eligible", "require"])
+
+    scored = []
+    for opt in options:
+        opt_low = opt.lower()
+        score = sum(2 if kw.startswith("+") or len(kw) >= 4 else 1 for kw in keywords if kw in opt_low)
+        scored.append((score, opt))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [opt for score, opt in scored[:max_options]]
+
 async def ai_generate_tailored_answer(
     question_text: str,
     candidate_profile: Dict[str, Any],
@@ -264,48 +350,6 @@ async def ai_generate_tailored_answer(
         if cached is not None:
             return str(cached)
 
-    # Selectively extract relevant slices of profile rather than dumping everything
-    full_name = candidate_profile.get("full_name", "")
-    raw_skills = candidate_profile.get("skills", [])
-    skills = ", ".join([str(s) for s in raw_skills]) if isinstance(raw_skills, list) else str(raw_skills)
-    location = candidate_profile.get("location", "")
-    summary = candidate_profile.get("summary", "")
-
-    raw_projects = candidate_profile.get("projects", [])
-    project_strs = []
-    for p in raw_projects:
-        if isinstance(p, dict):
-            p_title = p.get("title") or p.get("name") or ""
-            p_desc = p.get("description") or ""
-            project_strs.append(f"{p_title}: {p_desc}".strip(": "))
-        elif isinstance(p, str):
-            project_strs.append(p)
-    projects = "\n".join(project_strs)
-
-    raw_exp = candidate_profile.get("work_experience", [])
-    exp_strs = []
-    for e in raw_exp:
-        if isinstance(e, dict):
-            role = e.get("role") or e.get("title") or ""
-            comp = e.get("company") or ""
-            dur = e.get("duration") or ""
-            exp_strs.append(f"{role} at {comp} ({dur})".strip())
-        elif isinstance(e, str):
-            exp_strs.append(e)
-    experience = "\n".join(exp_strs)
-
-    pronouns = candidate_profile.get("pronouns") or "Not specified"
-    gender = candidate_profile.get("gender") or "Not specified"
-
-    candidate_facts = f"""Candidate Name: {full_name}
-Pronouns: {pronouns}
-Gender: {gender}
-Location: {location}
-Summary: {summary}
-Skills: {skills}
-Projects: {projects}
-Experience: {experience}"""
-
     # Check explicit salary queries first
     q_low = clean_q.lower()
     if "current salary" in q_low or "present salary" in q_low or "current ctc" in q_low:
@@ -319,57 +363,72 @@ Experience: {experience}"""
     # OPTION CHOICE PATH (JSON with option_index & confidence)
     # =========================================================================
     if options:
-        trimmed_options = options
-        if len(options) > 25:
-            favored = []
-            cand_keywords = ["india", "+91", "91", "inr", "rupee", "kerala", "kochi", "bangalore"]
-            for o in options:
-                if any(kw in o.lower() for kw in cand_keywords):
-                    favored.append(o)
-            for o in options:
-                if o not in favored:
-                    favored.append(o)
-                if len(favored) >= 20:
-                    break
-            trimmed_options = favored
+        trimmed_options = prune_options_for_prompt(options, candidate_profile, max_options=12)
+        compact_facts = extract_compact_profile_facts(candidate_profile)
 
         formatted_opts = "\n".join([f'[{idx}] "{sanitize_form_label(opt, 80)}"' for idx, opt in enumerate(trimmed_options)])
-        prompt = f"""{candidate_facts}
+        prompt = f"""Candidate Facts:
+{compact_facts}
 
 Job Position: {clean_job}
 Question: "{clean_q}"
 Available Options:
 {formatted_opts}
 
-Task: Select the single best matching option from Available Options for this candidate based strictly on candidate facts.
-Respond ONLY with a valid JSON object containing:
-- "option_index": integer (0 to {len(trimmed_options) - 1} corresponding to the best option, or -1 if no option matches or candidate facts lack info)
-- "confidence": float between 0.0 and 1.0 (confidence that this option accurately reflects candidate facts)
-- "reason": concise explanation
-
-Example response:
-{{"option_index": 0, "confidence": 0.95, "reason": "Candidate facts state willingness to relocate."}}
+Task: Choose the single best option matching the candidate facts.
+Respond with JSON:
+{{"option_index": <int 0 to {len(trimmed_options) - 1}>, "confidence": <float 0.0 to 1.0>, "reason": "<short explanation>"}}
 """
-        system_prompt = "You are a factual form option evaluator. You strictly output valid JSON containing option_index and confidence."
+        system_prompt = "You are a factual form option evaluator. Output strictly a valid JSON object."
         print(f"[Local AI Prompt] Asking Qwen option choice for: '{clean_q[:70]}'")
 
-        resp = await call_qwen(prompt, system_prompt=system_prompt, max_tokens=100, timeout=15.0)
+        resp = await call_qwen(prompt, system_prompt=system_prompt, max_tokens=400, timeout=20.0)
         if not resp:
             print(f"[Local AI Decision] Timeout or failure calling LLM for '{clean_q}'. Asking user.")
             set_cached_llm_result(cache_key, "choice", "__ASK_USER__")
             return None
 
-        # Parse JSON
-        m = re.search(r'\{[\s\S]*?\}', resp)
-        if not m:
-            print(f"[Local AI Decision] Invalid JSON in LLM response: '{resp[:100]}'. Asking user.")
-            set_cached_llm_result(cache_key, "choice", "__ASK_USER__")
-            return None
+        # Clean think tags and markdown code blocks
+        clean_resp = re.sub(r'<think>[\s\S]*?</think>', '', resp, flags=re.DOTALL).strip()
+        clean_resp = re.sub(r'```(?:json)?', '', clean_resp).strip('`').strip()
 
-        try:
-            data = json.loads(m.group(0))
-        except Exception as e:
-            print(f"[Local AI Decision] Failed to parse JSON ({e}): '{resp[:100]}'. Asking user.")
+        data = None
+        # Try JSON extraction
+        m = re.search(r'\{[\s\S]*?"option_index"[\s\S]*?\}', clean_resp)
+        if not m:
+            m = re.search(r'\{[\s\S]*?\}', clean_resp)
+        if not m:
+            m = re.search(r'\{[\s\S]*?"option_index"[\s\S]*?\}', resp)
+
+        if m:
+            json_str = m.group(0)
+            try:
+                data = json.loads(json_str)
+            except Exception:
+                try:
+                    fixed = re.sub(r"'", '"', json_str)
+                    fixed = re.sub(r',\s*([\}\]])', r'\1', fixed)
+                    data = json.loads(fixed)
+                except Exception:
+                    data = None
+
+        # Robust regex fallback
+        if not data or not isinstance(data, dict):
+            target_str = clean_resp if clean_resp else resp
+            idx_m = re.search(r'"?option_index"?\s*:\s*(-?\d+)', target_str)
+            if not idx_m:
+                idx_m = re.search(r'(?:option|index|choice)\s*(?:index)?[\s":=]+(-?\d+)', target_str, re.I)
+            conf_m = re.search(r'"?confidence"?\s*:\s*([0-9\.]+|"[^"]+")', target_str)
+            reason_m = re.search(r'"?reason"?\s*:\s*"([^"]+)"', target_str)
+            if idx_m:
+                data = {
+                    "option_index": int(idx_m.group(1)),
+                    "confidence": conf_m.group(1) if conf_m else 0.8,
+                    "reason": reason_m.group(1) if reason_m else ""
+                }
+
+        if not data:
+            print(f"[Local AI Decision] Could not parse decision from: '{resp[:100]}'. Asking user.")
             set_cached_llm_result(cache_key, "choice", "__ASK_USER__")
             return None
 
@@ -390,11 +449,27 @@ Example response:
             set_cached_llm_result(cache_key, "choice", "__ASK_USER__")
             return None
 
-        # Read confidence
-        try:
-            conf = float(data.get("confidence", 0.0))
-        except (ValueError, TypeError):
-            conf = 0.0
+        # Read confidence with robust string & percentage handling
+        raw_conf = data.get("confidence", 0.0)
+        conf = 0.0
+        if isinstance(raw_conf, str):
+            c_low = raw_conf.lower().strip().strip('"').strip("'")
+            if c_low in ["high", "very high", "highest", "certain"]:
+                conf = 0.95
+            elif c_low in ["medium", "moderate"]:
+                conf = 0.70
+            elif c_low in ["low"]:
+                conf = 0.30
+            else:
+                try:
+                    c_num = float(re.sub(r'[^0-9\.]', '', c_low))
+                    conf = c_num / 100.0 if c_num > 1.0 else c_num
+                except Exception:
+                    conf = 0.0
+        elif isinstance(raw_conf, (int, float)):
+            conf = float(raw_conf)
+            if conf > 1.0 and conf <= 100.0:
+                conf = conf / 100.0
 
         threshold = settings.LLM_CONFIDENCE_THRESHOLD
         if conf < threshold:
@@ -410,6 +485,18 @@ Example response:
     # =========================================================================
     # FREE-TEXT SUGGESTION PATH (Strictly for question batch suggestions)
     # =========================================================================
+    full_name = candidate_profile.get("full_name", "")
+    location = candidate_profile.get("location", "")
+    summary = candidate_profile.get("summary", "")
+    skills = candidate_profile.get("skills", "")
+    if isinstance(skills, list):
+        skills = ", ".join([str(s) for s in skills[:15]])
+
+    candidate_facts = f"""Candidate Name: {full_name}
+Location: {location}
+Summary: {summary[:250]}
+Skills: {skills}"""
+
     prompt = f"""{candidate_facts}
 
 Job Position: {clean_job}

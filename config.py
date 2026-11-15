@@ -64,9 +64,9 @@ class Settings:
     @property
     def LLM_CONFIDENCE_THRESHOLD(self) -> float:
         try:
-            return float(os.getenv("LLM_CONFIDENCE_THRESHOLD", "0.8"))
+            return float(os.getenv("LLM_CONFIDENCE_THRESHOLD", "0.5"))
         except (ValueError, TypeError):
-            return 0.8
+            return 0.5
 
     @property
     def HEADLESS_BROWSER(self) -> bool:
