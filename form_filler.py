@@ -2,12 +2,17 @@ import os
 import re
 import time
 import asyncio
+from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional
 from playwright.async_api import Page, Frame, ElementHandle
 from field_rules import get_field_match_by_rules
 from field_lookup import lookup_field_value, LookupStage
 from ai_client import ai_interpret_field, ai_match_saved_answers, ai_generate_tailored_answer
-from widget_executors import WidgetType, widget_registry, verify_filled_widgets
+from widget_executors import (
+    WidgetType, widget_registry, verify_filled_widgets,
+    KNOWN_DATE_PICKER_CLASSES, parse_date_value, format_date_for_element
+)
+from database import generate_question_key
 
 async def detect_security_checkpoint(page: Page) -> Optional[str]:
     """
@@ -127,21 +132,16 @@ async def get_form_context(page: Page):
     return best_context if best_context != page.main_frame else page
 
 async def is_date_picker_element(ctx, el: ElementHandle, label: str) -> bool:
-    """Detect if an element is a native date input or custom calendar picker."""
+    """Detect if an element is a native date input or custom calendar picker using word boundaries on known picker classes."""
     try:
         inp_type = (await el.get_attribute("type") or "").lower()
-        if inp_type in ["date", "month", "datetime-local"]:
+        if inp_type in ["date", "month"]:
             return True
-        el_class = (await el.get_attribute("class") or "").lower()
-        if any(dp in el_class for dp in ["datepicker", "hasdatepicker", "date-picker", "flatpickr", "p-datepicker", "bs-datepicker"]):
+        el_class = await el.get_attribute("class") or ""
+        if KNOWN_DATE_PICKER_CLASSES.search(el_class):
             return True
-        parent_class = await el.evaluate("e => e.parentElement ? e.parentElement.className.toLowerCase() : ''")
-        if any(dp in parent_class for dp in ["calendar", "datepicker", "date"]):
-            return True
-        el_id = (await el.get_attribute("id") or "").lower()
-        el_name = (await el.get_attribute("name") or "").lower()
-        lbl = label.lower()
-        if any(w in el_id or w in el_name or w in lbl for w in ["dateofjoining", "dateofrelieving", "joiningdate", "startdate", "enddate", "birthdate", "graduationdate"]):
+        parent_class = await el.evaluate("e => e.parentElement ? (e.parentElement.className || '') : ''")
+        if KNOWN_DATE_PICKER_CLASSES.search(parent_class):
             return True
     except Exception:
         pass
@@ -150,10 +150,21 @@ async def is_date_picker_element(ctx, el: ElementHandle, label: str) -> bool:
 async def set_date_on_element(el: ElementHandle, date_str: str) -> bool:
     """Universal date setter supporting jQuery UI datepicker, Flatpickr, native date, and formatted text."""
     try:
-        await el.evaluate("""(e, rawDate) => {
-            let d = new Date(rawDate);
+        parsed_d = parse_date_value(date_str)
+        if not parsed_d:
+            print(f"[set_date_on_element] Invalid date string '{date_str}', returning failure without fallback.")
+            return False
+
+        iso_date = parsed_d.isoformat()
+        day = f"{parsed_d.day:02d}"
+        mo = f"{parsed_d.month:02d}"
+        yr = f"{parsed_d.year:04d}"
+        mName = parsed_d.strftime("%B")
+
+        res = await el.evaluate("""(e, info) => {
+            let d = new Date(info.isoDate + 'T00:00:00');
             if (isNaN(d.getTime())) {
-                d = new Date();
+                return false; // Return failure, NEVER fallback to today's date!
             }
 
             // 1. jQuery UI Datepicker
@@ -161,7 +172,7 @@ async def set_date_on_element(el: ElementHandle, date_str: str) -> bool:
                 try {
                     window.jQuery(e).datepicker('setDate', d);
                     e.dispatchEvent(new Event('change', { bubbles: true }));
-                    return;
+                    return true;
                 } catch(err) {}
             }
 
@@ -169,7 +180,7 @@ async def set_date_on_element(el: ElementHandle, date_str: str) -> bool:
             if (e._flatpickr) {
                 try {
                     e._flatpickr.setDate(d, true);
-                    return;
+                    return true;
                 } catch(err) {}
             }
 
@@ -178,28 +189,32 @@ async def set_date_on_element(el: ElementHandle, date_str: str) -> bool:
                 try {
                     window.jQuery(e).datepicker('update', d);
                     e.dispatchEvent(new Event('change', { bubbles: true }));
-                    return;
+                    return true;
                 } catch(err) {}
             }
 
-            // 4. Fallback: remove readonly, format value based on element hints, and dispatch events with React setter
+            // 4. Format based on element hints (dd/mm/yyyy, mm/dd/yyyy, yyyy-mm-dd, MMM yyyy)
             e.removeAttribute('readonly');
-            let months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
-            let mName = months[d.getMonth()];
-            let yr = d.getFullYear();
-            let day = ('0' + d.getDate()).slice(-2);
-            let mo = ('0' + (d.getMonth() + 1)).slice(-2);
+            let ph = (e.placeholder || '').toLowerCase().trim();
+            let inpType = (e.type || '').toLowerCase().trim();
+            let formattedVal = '';
 
-            let ph = (e.placeholder || '').toLowerCase();
-            let formattedVal = `${day}/${mo}/${yr}`;
-            if (ph.includes('june') || ph.includes('month') || ph.includes('yy')) {
-                formattedVal = `${mName} ${yr}`;
-            } else if (e.type === 'date') {
-                formattedVal = `${yr}-${mo}-${day}`;
-            } else if (ph.includes('mm/dd') || ph.includes('mm-dd')) {
-                formattedVal = `${mo}/${day}/${yr}`;
+            if (inpType === 'date') {
+                formattedVal = `${info.yr}-${info.mo}-${info.day}`;
+            } else if (inpType === 'month') {
+                formattedVal = `${info.yr}-${info.mo}`;
+            } else if (/\\bmm[\\/-]dd[\\/-]yyyy\\b/i.test(ph) || /\\bm[\\/-]d[\\/-]y\\b/i.test(ph)) {
+                formattedVal = `${info.mo}/${info.day}/${info.yr}`;
+            } else if (/\\bdd[\\/-]mm[\\/-]yyyy\\b/i.test(ph) || /\\bd[\\/-]m[\\/-]y\\b/i.test(ph)) {
+                formattedVal = `${info.day}/${info.mo}/${info.yr}`;
+            } else if (/\\byyyy[\\/-]mm[\\/-]dd\\b/i.test(ph)) {
+                formattedVal = `${info.yr}-${info.mo}-${info.day}`;
+            } else if (!/(\\bdd\\b|\\bd\\b|day)/i.test(ph) && (/\\b(mmm\\s*yyyy|month\\s*yyyy|month,\\s*year)\\b/i.test(ph) || ph === 'mmm yyyy' || ph === 'month yyyy')) {
+                formattedVal = `${info.mName} ${info.yr}`;
+            } else if (!/(\\bdd\\b|\\bd\\b|day)/i.test(ph) && /\\bmm[\\/-]yyyy\\b/i.test(ph)) {
+                formattedVal = `${info.mo}/${info.yr}`;
             } else {
-                formattedVal = `${day}/${mo}/${yr}`;
+                formattedVal = `${info.day}/${info.mo}/${info.yr}`;
             }
 
             try {
@@ -211,8 +226,15 @@ async def set_date_on_element(el: ElementHandle, date_str: str) -> bool:
 
             e.dispatchEvent(new Event('input', { bubbles: true }));
             e.dispatchEvent(new Event('change', { bubbles: true }));
-        }""", date_str)
-        return True
+            return true;
+        }""", {
+            "isoDate": iso_date,
+            "day": day,
+            "mo": mo,
+            "yr": yr,
+            "mName": mName
+        })
+        return bool(res)
     except Exception as e:
         print(f"Error setting date on element: {e}")
         return False
@@ -293,11 +315,9 @@ async def get_option_label(ctx, el: ElementHandle) -> str:
     """
     try:
         # 1. Wrapping ancestor label
-        parent_lbl = await el.query_selector("xpath=ancestor::label")
-        if parent_lbl:
-            txt = (await parent_lbl.inner_text() or "").strip()
-            if txt:
-                return txt.rstrip("*").strip()
+        parent_txt = await el.evaluate("e => e.closest('label') ? e.closest('label').innerText.trim() : ''")
+        if parent_txt:
+            return parent_txt.rstrip("*").strip()
 
         # 2. Matching <label for="...">
         el_id = await el.get_attribute("id")
@@ -381,11 +401,9 @@ async def get_element_label(ctx, el: ElementHandle) -> str:
 
         # 4. Check wrapping ancestor label (if not radio)
         if inp_type != "radio":
-            parent_lbl = await el.query_selector("xpath=ancestor::label")
-            if parent_lbl:
-                txt = (await parent_lbl.inner_text() or "").strip()
-                if txt:
-                    return txt.rstrip("*").strip()
+            parent_txt = await el.evaluate("e => e.closest('label') ? e.closest('label').innerText.trim() : ''")
+            if parent_txt:
+                return parent_txt.rstrip("*").strip()
 
         # 5. Check question container header or label
         container = await el.query_selector("xpath=ancestor::div[contains(@class, 'field') or contains(@class, 'form-group') or contains(@class, 'question') or contains(@class, 'select__container') or contains(@class, 'form-item')]")
@@ -449,31 +467,37 @@ async def map_intent_to_profile(intent: str, profile: Dict[str, Any]) -> Optiona
         "location": profile.get("location", ""),
         "linkedin": profile.get("linkedin_url", ""),
         "github": profile.get("github_url", ""),
-        "portfolio": profile.get("portfolio_url", "") or profile.get("linkedin_url", ""),
-        "optional_notes": profile.get("summary", "") or "N/A"
+        "portfolio": profile.get("portfolio_url", "") or profile.get("linkedin_url", "")
     }
     return mapping.get(intent)
+
+SENSITIVE_PATTERNS = [
+    r'\b(salary|compensation|pay|rate|ctc|remuneration)\b',
+    r'\b(expected\s*(salary|ctc|compensation|pay))\b',
+    r'\b(years?\s*(of\s*)?experience|how\s*many\s*years)\b',
+    r'\b(notice\s*period|how\s*soon|available\s*to\s*join)\b',
+    r'\b(gpa|cgpa|grade\s*point|percentage)\b',
+    r'\b(visa|sponsorship|authorized\s*to\s*work|work\s*authorization|citizenship|alien)\b',
+    r'\b(disability|veteran|gender|race|ethnicity|sexual\s*orientation)\b',
+    r'\b(criminal|felony|misdemeanor|background\s*check|drug\s*test)\b',
+    r'\b(security\s*clearance|secret\s*clearance)\b',
+    r'\b(consent|agreement|acknowledge)\b',
+    r'\b(dob|birth\s*date|date\s*of\s*birth)\b',
+    r'\b(ssn|social\s*security|passport|national\s*id)\b'
+]
+SENSITIVE_REGEX = re.compile('|'.join(SENSITIVE_PATTERNS), re.IGNORECASE)
 
 def is_sensitive_question(label: str) -> bool:
     """
     Detect whether a question involves sensitive compliance, legal, compensation,
-    or quantitative qualification terms (salary, years of experience, sponsorship).
+    or quantitative qualification terms using strict word-boundary matching.
+    Prevents false-positives like 'rate' matching 'corporate' or 'accelerate'.
     These fields must NEVER be invented by AI — they must come strictly from the
     resume profile or previously approved saved answers, or pause for user input.
     """
-    lbl = label.lower()
-    sensitive_keywords = [
-        "salary", "compensation", "pay", "rate", "ctc", "expected", "remuneration",
-        "years of experience", "years experience", "how many years", "experience with",
-        "notice period", "how soon", "available to join",
-        "gpa", "cgpa", "grade", "percentage",
-        "visa", "sponsorship", "authorized to work", "work authorization", "citizenship", "alien",
-        "disability", "veteran", "gender", "race", "ethnicity", "sexual orientation",
-        "criminal", "felony", "misdemeanor", "background check", "drug test",
-        "security clearance", "secret clearance",
-        "consent", "agreement", "acknowledge"
-    ]
-    return any(k in lbl for k in sensitive_keywords)
+    if not label:
+        return False
+    return bool(SENSITIVE_REGEX.search(label.strip()))
 
 async def verify_form_completion_and_errors(ctx) -> Dict[str, Any]:
     """
@@ -567,25 +591,69 @@ async def verify_form_completion_and_errors(ctx) -> Dict[str, Any]:
         "is_valid": len(validation_errors) == 0 and len(empty_required) == 0
     }
 
+@dataclass
+class RestoreResult:
+    restored_count: int
+    total_fields: int
+    verified_fields: List[Dict[str, Any]] = field(default_factory=list)
+    failed_fields: List[Dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def all_passed(self) -> bool:
+        return len(self.failed_fields) == 0
+
+    def __int__(self) -> int:
+        return self.restored_count
+
+    def __index__(self) -> int:
+        return self.restored_count
+
+    def __bool__(self) -> bool:
+        return self.restored_count > 0
+
+    def __str__(self) -> str:
+        return str(self.restored_count)
+
+    def __gt__(self, other) -> bool:
+        return self.restored_count > (int(other) if not isinstance(other, int) else other)
+
+    def __ge__(self, other) -> bool:
+        return self.restored_count >= (int(other) if not isinstance(other, int) else other)
+
+    def __lt__(self, other) -> bool:
+        return self.restored_count < (int(other) if not isinstance(other, int) else other)
+
+    def __le__(self, other) -> bool:
+        return self.restored_count <= (int(other) if not isinstance(other, int) else other)
+
+    def __eq__(self, other) -> bool:
+        return self.restored_count == (int(other) if not isinstance(other, int) else other)
+
 async def fast_restore_form_data(
     ctx,
     form_data: Dict[str, Any],
     resume_path: Optional[str] = None
-) -> int:
+) -> RestoreResult:
     """
     Crash Recovery Engine:
     Fast-restores previously filled fields directly into the active form DOM
-    without calling any LLM / AI models.
-    Returns the number of restored fields.
+    using dedicated widget executors and re-verifies each restored value.
+    Eliminates :has-text and blind keyboard navigation.
+    Returns RestoreResult with count and verification details.
     """
     if not form_data or not isinstance(form_data, dict):
-        return 0
+        return RestoreResult(restored_count=0, total_fields=0)
     
     fields = form_data.get("fields", {})
     if not fields or not isinstance(fields, dict):
-        return 0
+        return RestoreResult(restored_count=0, total_fields=0)
 
     restored_count = 0
+    verified_fields: List[Dict[str, Any]] = []
+    failed_fields: List[Dict[str, Any]] = []
+
+    # Pre-fetch interactive elements for fallback label matching
+    interactive_elements = None
 
     for key, f in fields.items():
         try:
@@ -596,8 +664,8 @@ async def fast_restore_form_data(
             f_id = f.get("id")
             f_name = f.get("name")
             f_label = f.get("label", "")
-            f_type = f.get("type", "text")
-            f_tag = f.get("tag", "input")
+            f_type = (f.get("type") or "text").lower().strip()
+            f_tag = (f.get("tag") or "input").lower().strip()
             f_selector = f.get("selector", "")
 
             el = None
@@ -619,114 +687,97 @@ async def fast_restore_form_data(
                 except Exception:
                     el = None
 
+            # Find by label without :has-text
             if not el and f_label:
                 try:
-                    safe_lbl = f_label.replace('"', '\\"')
-                    lbl_el = await ctx.query_selector(f'label:has-text("{safe_lbl}")')
-                    if lbl_el:
-                        for_attr = await lbl_el.get_attribute("for")
-                        if for_attr:
-                            el = await ctx.query_selector(f"#{for_attr}")
+                    f_lbl_clean = f_label.strip().lower()
+                    all_labels = await ctx.query_selector_all('label')
+                    for l_el in all_labels:
+                        l_txt = (await l_el.inner_text() or "").strip().lower()
+                        if l_txt == f_lbl_clean or f_lbl_clean in l_txt:
+                            for_attr = await l_el.get_attribute("for")
+                            if for_attr:
+                                el = await ctx.query_selector(f"#{for_attr}")
+                                if el:
+                                    break
+                except Exception:
+                    el = None
+
+            # Fallback to interactive controls
+            if not el and f_label:
+                try:
+                    if interactive_elements is None:
+                        interactive_elements = await ctx.query_selector_all('input, select, textarea, [role="combobox"]')
+                    f_lbl_clean = f_label.strip().lower()
+                    for cand in interactive_elements:
+                        cand_lbl = (await get_element_label(ctx, cand)).strip().lower()
+                        if cand_lbl and (cand_lbl == f_lbl_clean or f_lbl_clean in cand_lbl or cand_lbl in f_lbl_clean):
+                            el = cand
+                            break
                 except Exception:
                     el = None
 
             if not el:
                 continue
 
-            # Restore based on field type
-            if f_type == "file":
-                has_files = await el.evaluate("e => e.files && e.files.length > 0")
-                target_file = val if (val and os.path.exists(str(val))) else resume_path
-                if not has_files and target_file and os.path.exists(target_file):
-                    await el.set_input_files(target_file)
-                    await el.evaluate("""e => {
-                        e.dispatchEvent(new Event('input', { bubbles: true }));
-                        e.dispatchEvent(new Event('change', { bubbles: true }));
-                    }""")
-                    restored_count += 1
-
-            elif f_tag == "select" or f_type == "select":
-                cur_val = await el.evaluate("e => e.value || (e.options && e.selectedIndex >= 0 ? e.options[e.selectedIndex].text : '')")
-                if not cur_val or cur_val.strip() in ["", "0", "-1", "Select", "Select..."]:
-                    await el.evaluate("""(sel, target) => {
-                        let tLow = String(target).toLowerCase().trim();
-                        for (let o of sel.options) {
-                            let oText = o.text.toLowerCase().trim();
-                            let oVal = o.value.toLowerCase().trim();
-                            if (oText === tLow || oVal === tLow || oText.includes(tLow) || tLow.includes(oText)) {
-                                sel.value = o.value;
-                                sel.dispatchEvent(new Event('change', { bubbles: true }));
-                                if (window.jQuery && window.jQuery(sel).data('select2')) {
-                                    window.jQuery(sel).val(o.value).trigger('change');
-                                }
-                                break;
-                            }
-                        }
-                    }""", str(val))
-                    restored_count += 1
-
-            elif f_type == "combobox":
-                parent_container = await el.query_selector("xpath=ancestor::div[contains(@class, 'select')]")
-                val_container = await parent_container.query_selector("[class*='singleValue'], [class*='single-value'], .select2-selection__rendered") if parent_container else None
-                curr_txt = (await val_container.inner_text() or "").strip() if val_container else ""
-                if not curr_txt or curr_txt in ["Select...", "", "Select", "Select an option"]:
-                    control = await parent_container.query_selector(".select__control") if parent_container else None
-                    if control:
-                        await control.click()
-                        await asyncio.sleep(0.3)
-                    opt_match = await ctx.query_selector(f'.select__option:has-text("{val}")')
-                    if opt_match:
-                        await opt_match.click()
-                        restored_count += 1
-                    else:
-                        await el.fill(str(val))
-                        await asyncio.sleep(0.5)
-                        await el.press("Enter")
-                        restored_count += 1
-
+            # Map to WidgetType
+            if f_type == "file" or f_tag == "file":
+                w_type = WidgetType.FILE
+            elif f_type in ["select", "native_select"] or f_tag == "select":
+                w_type = WidgetType.NATIVE_SELECT
+            elif f_type in ["combobox", "custom_combobox"] or f_tag == "combobox":
+                w_type = WidgetType.CUSTOM_COMBOBOX
             elif f_type == "radio":
-                is_checked = await el.is_checked()
-                if not is_checked:
-                    name_attr = await el.get_attribute("name") or f_name
-                    group_radios = await ctx.query_selector_all(f'input[type="radio"][name="{name_attr}"]') if name_attr else [el]
-                    for r_el in group_radios:
-                        r_lbl = await get_option_label(ctx, r_el)
-                        if (r_lbl.lower() == str(val).lower() or 
-                            (str(val).lower() == "yes" and r_lbl.lower().startswith("yes")) or 
-                            (str(val).lower() == "no" and r_lbl.lower().startswith("no"))):
-                            await r_el.click()
-                            restored_count += 1
-                            break
-
+                w_type = WidgetType.RADIO
             elif f_type == "checkbox":
-                is_checked = await el.is_checked()
-                if not is_checked and str(val).lower() in ["yes", "true", "1", "check", "checked"]:
-                    await el.check()
-                    restored_count += 1
-
+                w_type = WidgetType.CHECKBOX
             elif f_type == "date":
-                cur_val = await el.input_value()
-                if not cur_val or cur_val.strip() != str(val).strip():
-                    await set_date_on_element(el, str(val))
-                    restored_count += 1
-
+                w_type = WidgetType.DATE
             else:
-                cur_val = await el.input_value()
-                if not cur_val or cur_val.strip() != str(val).strip():
-                    if f_type == "number":
-                        num_match = re.search(r'\d+(?:\.\d+)?', str(val))
-                        v_num = num_match.group(0) if num_match else "0"
-                        await el.fill(v_num)
-                    else:
-                        await el.fill(str(val))
-                    await el.evaluate("""e => {
-                        e.dispatchEvent(new Event('input', { bubbles: true }));
-                        e.dispatchEvent(new Event('change', { bubbles: true }));
-                    }""")
-                    restored_count += 1
+                w_type = WidgetType.TEXT
+
+            target_val = val
+            if w_type == WidgetType.FILE:
+                if not (val and os.path.exists(str(val))):
+                    target_val = resume_path
+
+            if target_val is None:
+                continue
+
+            # Restore and re-verify via dedicated widget executor
+            exec_res = await widget_registry.get_executor(w_type).execute(ctx, el, target_val)
+
+            if exec_res.success and exec_res.verification_passed:
+                restored_count += 1
+                verified_fields.append({
+                    "field": f_label or f_id or key,
+                    "target_value": str(target_val),
+                    "verified_value": exec_res.verified_value
+                })
+            else:
+                failed_fields.append({
+                    "field": f_label or f_id or key,
+                    "target_value": str(target_val),
+                    "verified_value": exec_res.verified_value,
+                    "error": exec_res.error or "Verification check failed after restore"
+                })
+                print(f"[Crash Recovery Warning] Verification failed restoring '{f_label or f_id or key}': expected '{target_val}', got '{exec_res.verified_value}' ({exec_res.error})")
 
         except Exception as e:
             print(f"[Crash Recovery] Error restoring field '{key}': {e}")
+            failed_fields.append({
+                "field": key,
+                "target_value": str(f.get("value")),
+                "verified_value": None,
+                "error": str(e)
+            })
+
+    return RestoreResult(
+        restored_count=restored_count,
+        total_fields=len(fields),
+        verified_fields=verified_fields,
+        failed_fields=failed_fields
+    )
 
     return restored_count
 
@@ -773,19 +824,71 @@ async def fill_form_on_page(
         "completed": True,
         "needs_input": False,
         "unanswered_question": None,
+        "unanswered_questions": [],
         "ai_suggestion": "",
         "fields_filled": [],
         "has_next_page": False,
         "submit_button_found": False,
         "validation_errors": [],
+        "warnings": [],
         "form_data": form_data
     }
+
+    # Batch question collector: collects all unknown questions on page without crashing
+    unanswered_questions: List[Dict[str, Any]] = []
+    seen_question_labels = set()
+
+    def collect_unanswered_question(
+        field_id: str,
+        label: str,
+        field_type: str,
+        options: Optional[List[str]] = None,
+        ai_suggestion: str = "",
+        category: str = "general"
+    ):
+        clean_lbl = (label or "").strip()
+        lbl_key = clean_lbl.lower()
+        if not clean_lbl or lbl_key in seen_question_labels:
+            return
+
+        seen_question_labels.add(lbl_key)
+
+        # Generate stable, canonical slugified question key
+        stable_key = generate_question_key(clean_lbl, field_type=field_type, company_name=job_context)
+
+        # Scope classification: location, relocation, notice period, nda are company-specific
+        company_specific_keywords = [
+            "relocat", "office", "bangalore", "bengaluru", "location", "commute",
+            "notice period", "nda", "non-disclosure", "policy", "agreement"
+        ]
+        is_company_scope = any(k in lbl_key for k in company_specific_keywords)
+        scope = "this company" if is_company_scope else "global"
+
+        q_dict = {
+            "id": f"q_{len(unanswered_questions) + 1}",
+            "question_key": stable_key,
+            "field_id": field_id or stable_key,
+            "label": clean_lbl,
+            "type": field_type,
+            "options": options or [],
+            "ai_suggestion": ai_suggestion,
+            "category": category,
+            "scope": scope,
+            "save_for_future": True
+        }
+        unanswered_questions.append(q_dict)
+        print(f"[FormFiller] Collected unknown question into batch: '{clean_lbl}' ({field_type}, key={stable_key})")
 
     # Query all interactive form controls in natural top-to-bottom DOM order
     elements = await ctx.query_selector_all('input, select, textarea, [role="combobox"]')
     processed_radio_groups = set()
 
     for el_idx, el in enumerate(elements):
+        label = ""
+        tag = ""
+        inp_type = ""
+        el_id = ""
+        name = ""
         try:
             tag = await el.evaluate("e => e.tagName.toLowerCase()")
             inp_type = (await el.get_attribute("type") or "").lower()
@@ -870,12 +973,19 @@ async def fill_form_on_page(
             # =========================================================================
             # 2. CUSTOM COMBOBOXES & REACT/GREENHOUSE TYPEAHEADS
             # =========================================================================
-            if role == "combobox" or (inp_type == "text" and await el.query_selector("xpath=ancestor::div[contains(@class, 'select')]")):
+            is_combobox = (
+                role == "combobox"
+                or (await el.get_attribute("aria-haspopup") == "listbox")
+                or bool(await el.get_attribute("aria-controls"))
+                or bool(await el.evaluate("e => !!e.closest('[role=\"combobox\"], div[class*=\"select\"], div[class*=\"MuiAutocomplete\"]')"))
+            )
+            if is_combobox:
                 cb_txt = (await el.inner_text() or "").strip()
                 if cb_txt in ["+91", "INR", "USD"] or (cb_txt == "Select" and any(w in label.lower() for w in ["phone", "code", "dial"])):
                     continue
 
-                parent_container = await el.query_selector("xpath=ancestor::div[contains(@class, 'select')]")
+                parent_handle = await el.evaluate_handle("e => e.closest('[role=\"combobox\"], div[class*=\"select\"], div[class*=\"MuiAutocomplete\"]')")
+                parent_container = parent_handle.as_element() if parent_handle else None
                 if parent_container:
                     val_container = await parent_container.query_selector("[class*='singleValue'], [class*='single-value'], .select2-selection__rendered")
                     curr_txt = (await val_container.inner_text() or "").strip() if val_container else ""
@@ -888,17 +998,21 @@ async def fill_form_on_page(
                     country_val = "India"
                     if profile.get("location") and "india" in profile.get("location", "").lower():
                         country_val = "India"
-                    control = await parent_container.query_selector(".select__control") if parent_container else None
-                    if control:
-                        await control.click()
-                        await asyncio.sleep(0.3)
-                        opt_match = await ctx.query_selector(f'.select__option:has-text("{country_val}")') or await page.query_selector(f'.select__option:has-text("{country_val}")')
-                        if opt_match:
-                            await opt_match.click()
-                            result["fields_filled"].append({"field": label, "value": country_val})
-                            record_filled(el_id, name, label, tag, "combobox", country_val)
-                            await asyncio.sleep(0.8)
-                            continue
+                    cb_exec = widget_registry.get_executor(WidgetType.CUSTOM_COMBOBOX)
+                    exec_res = await cb_exec.execute(ctx, el, country_val)
+                    if exec_res.success:
+                        val_str = str(exec_res.verified_value or country_val)
+                        result["fields_filled"].append({
+                            "field": label,
+                            "value": val_str,
+                            "type": "combobox",
+                            "id": el_id,
+                            "name": name,
+                            "selector": f"#{el_id}" if el_id else "",
+                            "verified": exec_res.verified_value
+                        })
+                        record_filled(el_id, name, label, tag, "combobox", val_str, selector=f"#{el_id}" if el_id else "")
+                        continue
 
                 # B. Location / City typeahead
                 is_location_field = bool(re.search(r'^(location|current\s*location|location\s*\(city\)|city|address)$', label.lower().strip())) or (
@@ -907,38 +1021,23 @@ async def fill_form_on_page(
                 if is_location_field:
                     loc_val = profile.get("location") or "Kochi, Kerala, India"
                     city_search = loc_val.split(",")[0].strip() if "," in loc_val else loc_val
-                    try:
-                        control = await parent_container.query_selector(".select__control") if parent_container else None
-                        if control:
-                            await control.click()
-                            await asyncio.sleep(0.3)
-                        await el.focus()
-                        await el.type(city_search, delay=80)
-                        await asyncio.sleep(1.2)
-                        opt_match = await ctx.query_selector(f'.select__option:has-text("{city_search}")')
-                        if not opt_match:
-                            opt_match = await page.query_selector(f'.select__option:has-text("{city_search}")')
-                        if opt_match:
-                            matched_text = (await opt_match.inner_text() or "").strip()
-                            await opt_match.click()
-                            result["fields_filled"].append({"field": label, "value": matched_text or loc_val})
-                            record_filled(el_id, name, label, tag, "combobox", matched_text or loc_val)
-                        else:
-                            await page.keyboard.press("ArrowDown")
-                            await page.keyboard.press("Enter")
-                            result["fields_filled"].append({"field": label, "value": loc_val})
-                            record_filled(el_id, name, label, tag, "combobox", loc_val)
-                        await asyncio.sleep(0.4)
+                    cb_exec = widget_registry.get_executor(WidgetType.CUSTOM_COMBOBOX)
+                    exec_res = await cb_exec.execute(ctx, el, city_search)
+                    if exec_res.success:
+                        val_str = str(exec_res.verified_value or city_search)
+                        result["fields_filled"].append({
+                            "field": label,
+                            "value": val_str,
+                            "type": "combobox",
+                            "id": el_id,
+                            "name": name,
+                            "selector": f"#{el_id}" if el_id else "",
+                            "verified": exec_res.verified_value
+                        })
+                        record_filled(el_id, name, label, tag, "combobox", val_str, selector=f"#{el_id}" if el_id else "")
                         continue
-                    except Exception as e:
-                        print(f"Error autofilling location combobox: {e}")
 
-                # C. Check saved answers (memory) and non-sensitive deterministic rules
-                matched_val = await ai_match_saved_answers(label, saved_answers, company_name=job_context)
-                if not matched_val and not is_sensitive_question(label):
-                    matched_val = get_field_match_by_rules(label, profile)
-
-                # D. Open dropdown popup & extract options
+                # C. Extract options & check saved answers (memory) and non-sensitive deterministic rules
                 options = []
                 control = await parent_container.query_selector(".select__control") if parent_container else None
                 trigger = control or el
@@ -966,18 +1065,12 @@ async def fill_form_on_page(
                                 t = (await o.inner_text() or "").strip()
                                 if t and t not in options and not "select" in t.lower():
                                     options.append(t)
-
-                        if not options and matched_val:
-                            await el.fill(str(matched_val)[:3])
-                            await asyncio.sleep(0.5)
-                            if listbox:
-                                opt_els = await listbox.query_selector_all('[role="option"], .select__option')
-                                for o in opt_els:
-                                    t = (await o.inner_text() or "").strip()
-                                    if t and t not in options:
-                                        options.append(t)
                     except Exception as e:
-                        print(f"Error opening combobox: {e}")
+                        print(f"Combobox options extraction error for '{label}': {e}")
+
+                matched_val = await ai_match_saved_answers(label, saved_answers, field_type="combobox", options=options, company_name=job_context)
+                if not matched_val and not is_sensitive_question(label):
+                    matched_val = get_field_match_by_rules(label, profile)
 
                 # E. If matched_val is known, select via CustomComboboxWidgetExecutor
                 if matched_val:
@@ -1007,56 +1100,61 @@ async def fill_form_on_page(
                     ai_decision = await ai_generate_tailored_answer(label, profile, job_context=job_context, options=options)
                     print(f"[AI Decision] Qwen chose: '{ai_decision}' from {options}")
 
-                    result["needs_input"] = True
-                    result["unanswered_question"] = {
-                        "field_id": field_id,
-                        "label": label,
-                        "type": "select",
-                        "options": options
-                    }
-                    result["ai_suggestion"] = ai_decision or (options[0] if options else "")
-                    result["completed"] = False
-                    return result
+                    collect_unanswered_question(
+                        field_id=field_id,
+                        label=label,
+                        field_type="select",
+                        options=options,
+                        ai_suggestion=ai_decision or "",
+                        category="general"
+                    )
+                    continue
                 elif is_boolean_question:
                     fallback_options = ["Yes", "No"]
                     ai_decision = await ai_generate_tailored_answer(label, profile, job_context=job_context, options=fallback_options)
-                    result["needs_input"] = True
-                    result["unanswered_question"] = {
-                        "field_id": field_id,
-                        "label": label,
-                        "type": "select",
-                        "options": fallback_options
-                    }
-                    result["ai_suggestion"] = ai_decision or "Yes"
-                    result["completed"] = False
-                    return result
+                    collect_unanswered_question(
+                        field_id=field_id,
+                        label=label,
+                        field_type="select",
+                        options=fallback_options,
+                        ai_suggestion=ai_decision or "",
+                        category="general"
+                    )
+                    continue
                 else:
                     ai_decision = await ai_generate_tailored_answer(label, profile, job_context=job_context) or ""
-                    result["needs_input"] = True
-                    result["unanswered_question"] = {
-                        "field_id": field_id,
-                        "label": label,
-                        "type": "text",
-                        "options": []
-                    }
-                    result["ai_suggestion"] = ai_decision
-                    result["completed"] = False
-                    return result
+                    collect_unanswered_question(
+                        field_id=field_id,
+                        label=label,
+                        field_type="text",
+                        options=[],
+                        ai_suggestion=ai_decision,
+                        category="general"
+                    )
+                    continue
 
             # =========================================================================
             # 3. NATIVE SELECT DROPDOWNS (<select>)
             # =========================================================================
             if tag == "select":
+                selected_val = await el.evaluate("sel => sel.value ? sel.value.trim() : ''")
                 selected_text = await el.evaluate("sel => sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].text.trim() : ''")
-                if selected_text and selected_text.lower() not in ["select", "select an option", "select...", "-- select --", "choose", ""]:
+                is_placeholder = (
+                    not selected_val or
+                    selected_text.lower() in ["", "select", "choose"] or
+                    any(p in selected_text.lower() for p in ["select", "choose", "--", "please select"])
+                )
+                if not is_placeholder:
                     continue
 
                 options = await el.query_selector_all('option')
                 opt_texts = []
                 for opt in options:
+                    opt_val = await opt.get_attribute("value") or ""
                     txt = await opt.inner_text()
-                    if txt and txt.strip() and not any(skip in txt.lower() for skip in ["select an option", "select...", "-- select --"]):
-                        opt_texts.append(txt.strip())
+                    txt_clean = (txt or "").strip()
+                    if txt_clean and opt_val.strip() and not any(skip in txt_clean.lower() for skip in ["select an option", "select...", "-- select --", "please select", "--"]):
+                        opt_texts.append(txt_clean)
 
                 # A. Phone Country Code
                 is_phone_dial_code = "countrycode" in el_id or "countrycode" in name.lower() or any(w in label.lower() for w in ["country code", "dial code", "+91"]) or (opt_texts and any(ot in ["+91", "+93"] for ot in opt_texts[:10]))
@@ -1104,8 +1202,16 @@ async def fill_form_on_page(
                     record_filled(el_id, name, label or "Currency", tag, "select", "INR")
                     continue
 
-                # C. Check saved answers (memory) and non-sensitive deterministic rules
-                matched_val = await ai_match_saved_answers(label, saved_answers, company_name=job_context)
+                # C. Extract options & check saved answers (memory) and non-sensitive deterministic rules
+                select_options = []
+                try:
+                    select_options = await el.evaluate("""sel => {
+                        return Array.from(sel.options).map(o => o.text.trim()).filter(Boolean);
+                    }""")
+                except Exception:
+                    select_options = []
+
+                matched_val = await ai_match_saved_answers(label, saved_answers, field_type="select", options=select_options, company_name=job_context)
                 if not matched_val and not is_sensitive_question(label):
                     matched_val = get_field_match_by_rules(label, profile)
 
@@ -1136,7 +1242,7 @@ async def fill_form_on_page(
                     label=label,
                     field_type="select",
                     options=opt_texts[:25],
-                    ai_suggestion=ai_decision or (opt_texts[0] if opt_texts else ""),
+                    ai_suggestion=ai_decision or "",
                     category="general"
                 )
                 continue
@@ -1163,7 +1269,7 @@ async def fill_form_on_page(
                     continue
 
                 # Check saved answers (memory) and non-sensitive deterministic rules
-                matched_val = await ai_match_saved_answers(group_label, saved_answers, company_name=job_context)
+                matched_val = await ai_match_saved_answers(group_label, saved_answers, field_type="radio", options=radio_options, company_name=job_context)
                 if not matched_val and not is_sensitive_question(group_label):
                     matched_val = get_field_match_by_rules(group_label, profile)
 
@@ -1188,9 +1294,9 @@ async def fill_form_on_page(
                 collect_unanswered_question(
                     field_id=field_id,
                     label=group_label,
-                    field_type="select",
+                    field_type="radio",
                     options=radio_options or ["Yes", "No"],
-                    ai_suggestion=ai_decision or (radio_options[0] if radio_options else "Yes"),
+                    ai_suggestion=ai_decision or "",
                     category="general"
                 )
                 continue
@@ -1208,7 +1314,7 @@ async def fill_form_on_page(
 
                 # Policy: Consent, agreement, policy, and sensitive checkboxes must ALWAYS be confirmed by user
                 # unless explicitly approved and stored in reusable memory.
-                matched_val = await ai_match_saved_answers(checkbox_label, saved_answers, company_name=job_context)
+                matched_val = await ai_match_saved_answers(checkbox_label, saved_answers, field_type="checkbox", options=["Yes", "No", opt_lbl] if opt_lbl else ["Yes", "No"], company_name=job_context)
                 if matched_val and str(matched_val).lower() in ["yes", "true", "check", "1", opt_lbl.lower()]:
                     exec_res = await widget_registry.get_executor(WidgetType.CHECKBOX).execute(ctx, el, "Yes")
                     if exec_res.success:
@@ -1245,9 +1351,12 @@ async def fill_form_on_page(
                 if curr_val and curr_val.strip():
                     continue
 
-                matched_val = get_field_match_by_rules(label, profile)
-                if not matched_val:
-                    matched_val = await ai_match_saved_answers(label, saved_answers, company_name=job_context)
+                matched_val = None
+                # Sensitive date check: Date of Birth, DOB, etc. are sensitive and must NEVER be auto-filled
+                if not is_sensitive_question(label):
+                    matched_val = get_field_match_by_rules(label, profile)
+                    if not matched_val:
+                        matched_val = await ai_match_saved_answers(label, saved_answers, field_type="date", options=[], company_name=job_context)
 
                 if matched_val:
                     exec_res = await widget_registry.get_executor(WidgetType.DATE).execute(ctx, el, str(matched_val))
@@ -1266,18 +1375,12 @@ async def fill_form_on_page(
 
                 # Prompt user with HTML5 interactive datepicker -> Collect into batch
                 field_id = await el.get_attribute("id") or name or label
-                suggested_date = "2024-05-15"
-                if "reliev" in label.lower() or "end" in label.lower():
-                    suggested_date = "2024-08-15"
-                elif "birth" in label.lower() or "dob" in label.lower():
-                    suggested_date = "2004-10-03"
-
                 collect_unanswered_question(
                     field_id=field_id,
                     label=label,
                     field_type="date",
                     options=[],
-                    ai_suggestion=suggested_date,
+                    ai_suggestion=None,
                     category="timeline"
                 )
                 continue
@@ -1295,7 +1398,7 @@ async def fill_form_on_page(
                     continue
 
                 # Check saved answers (memory) and non-sensitive deterministic rules
-                matched_value = await ai_match_saved_answers(label, saved_answers, company_name=job_context)
+                matched_value = await ai_match_saved_answers(label, saved_answers, field_type="text", options=[], company_name=job_context)
                 if not matched_value and not is_sensitive_question(label):
                     matched_value = get_field_match_by_rules(label, profile)
 
@@ -1316,10 +1419,7 @@ async def fill_form_on_page(
                         matched_value = await map_intent_to_profile(intent, profile)
 
                     if not matched_value:
-                        matched_value = await ai_match_saved_answers(label, saved_answers, company_name=job_context)
-
-                    if not matched_value and not is_sensitive_question(label) and not field_intel.get("is_sensitive", False):
-                        matched_value = await ai_generate_tailored_answer(label, profile, job_context=job_context)
+                        matched_value = await ai_match_saved_answers(label, saved_answers, field_type="text", options=[], company_name=job_context)
 
                 if matched_value:
                     exec_res = await widget_registry.get_executor(WidgetType.TEXT).execute(ctx, el, matched_value)
@@ -1356,7 +1456,9 @@ async def fill_form_on_page(
                 continue
 
         except Exception as e:
-            print(f"Error handling form element [{el_idx}]: {e}")
+            err_msg = f"Error handling form element [{el_idx}] (label='{label or 'unknown'}', tag='{tag or 'unknown'}', type='{inp_type or 'unknown'}', id='{el_id or 'unknown'}'): {e}"
+            print(f"[FormFiller Error] {err_msg}")
+            result.setdefault("warnings", []).append(err_msg)
             continue
 
     # DYNAMIC FILE CHOOSER FALLBACK (For dropzones/buttons where input[type="file"] is instantiated on click)

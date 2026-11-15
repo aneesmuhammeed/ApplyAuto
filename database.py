@@ -4,6 +4,7 @@ import os
 import re
 import time
 import uuid
+import numpy as np
 from typing import Dict, Any, List, Optional
 from config import settings
 
@@ -26,7 +27,21 @@ def init_db():
         full_name TEXT DEFAULT '',
         email TEXT DEFAULT '',
         phone TEXT DEFAULT '',
+        phone_code TEXT DEFAULT '+91',
         location TEXT DEFAULT '',
+        country TEXT DEFAULT 'India',
+        preferred_location TEXT DEFAULT '',
+        total_experience_years TEXT DEFAULT '',
+        total_experience_months TEXT DEFAULT '',
+        notice_period TEXT DEFAULT '',
+        notice_period_days TEXT DEFAULT '',
+        current_salary TEXT DEFAULT '',
+        expected_salary TEXT DEFAULT '',
+        currency TEXT DEFAULT 'INR',
+        gender TEXT DEFAULT '',
+        pronouns TEXT DEFAULT '',
+        birth_date TEXT DEFAULT '',
+        referral_source TEXT DEFAULT 'LinkedIn',
         linkedin_url TEXT DEFAULT '',
         github_url TEXT DEFAULT '',
         portfolio_url TEXT DEFAULT '',
@@ -137,6 +152,40 @@ def init_db():
         cursor.execute("ALTER TABLE applications ADD COLUMN unanswered_questions TEXT DEFAULT '[]'")
     if "batch_answers" not in app_cols:
         cursor.execute("ALTER TABLE applications ADD COLUMN batch_answers TEXT DEFAULT '[]'")
+    if "verification_failed" not in app_cols:
+        cursor.execute("ALTER TABLE applications ADD COLUMN verification_failed INTEGER DEFAULT 0")
+    if "verification_confirmed" not in app_cols:
+        cursor.execute("ALTER TABLE applications ADD COLUMN verification_confirmed INTEGER DEFAULT 0")
+    if "requires_manual_confirmation" not in app_cols:
+        cursor.execute("ALTER TABLE applications ADD COLUMN requires_manual_confirmation INTEGER DEFAULT 0")
+    if "verification_failures" not in app_cols:
+        cursor.execute("ALTER TABLE applications ADD COLUMN verification_failures TEXT DEFAULT '[]'")
+    if "pre_submit_screenshot" not in app_cols:
+        cursor.execute("ALTER TABLE applications ADD COLUMN pre_submit_screenshot TEXT DEFAULT ''")
+    if "post_submit_screenshot" not in app_cols:
+        cursor.execute("ALTER TABLE applications ADD COLUMN post_submit_screenshot TEXT DEFAULT ''")
+
+    # Migrations for profiles table
+    prof_cols = [c[1] for c in cursor.execute("PRAGMA table_info(profiles)").fetchall()]
+    new_prof_cols = {
+        "phone_code": "TEXT DEFAULT '+91'",
+        "country": "TEXT DEFAULT 'India'",
+        "preferred_location": "TEXT DEFAULT ''",
+        "total_experience_years": "TEXT DEFAULT ''",
+        "total_experience_months": "TEXT DEFAULT ''",
+        "notice_period": "TEXT DEFAULT ''",
+        "notice_period_days": "TEXT DEFAULT ''",
+        "current_salary": "TEXT DEFAULT ''",
+        "expected_salary": "TEXT DEFAULT ''",
+        "currency": "TEXT DEFAULT 'INR'",
+        "gender": "TEXT DEFAULT ''",
+        "pronouns": "TEXT DEFAULT ''",
+        "birth_date": "TEXT DEFAULT ''",
+        "referral_source": "TEXT DEFAULT 'LinkedIn'"
+    }
+    for col_name, col_type in new_prof_cols.items():
+        if col_name not in prof_cols:
+            cursor.execute(f"ALTER TABLE profiles ADD COLUMN {col_name} {col_type}")
 
     # 4. Worker Status Heartbeat
     cursor.execute("""
@@ -148,6 +197,28 @@ def init_db():
         meta TEXT DEFAULT '{}'
     )
     """)
+
+    # 5. Persistent Embedding Cache (keyed by normalized_pattern)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS embedding_cache (
+        normalized_pattern TEXT PRIMARY KEY,
+        embedding BLOB NOT NULL,
+        dim INTEGER NOT NULL,
+        updated_at TEXT
+    )
+    """)
+
+    # 6. Persistent LLM Cache (keyed by cache_key = e.g. interpret/choice/freetext + normalized label)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS llm_cache (
+        cache_key TEXT PRIMARY KEY,
+        cache_type TEXT NOT NULL,
+        prompt_hash TEXT DEFAULT '',
+        response_json TEXT NOT NULL,
+        created_at TEXT
+    )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_llm_cache_type ON llm_cache(cache_type)")
 
     # Default profile record
     cursor.execute("SELECT id FROM profiles WHERE id = 'default'")
@@ -191,28 +262,74 @@ def update_profile(data: Dict[str, Any]):
     now = time.strftime('%Y-%m-%d %H:%M:%S')
     profile_id = data.get("id") or "default"
     
-    # serialize json lists
-    education = json.dumps(data.get("education", []))
-    work_exp = json.dumps(data.get("work_experience", []))
-    skills = json.dumps(data.get("skills", []))
-    projects = json.dumps(data.get("projects", []))
-    certs = json.dumps(data.get("certifications", []))
-    
+    # Fetch existing profile row to support safe partial merges
+    cur = conn.execute("SELECT * FROM profiles WHERE id = ?", (profile_id,))
+    existing_row = cur.fetchone()
+    existing = dict(existing_row) if existing_row else {}
+
+    def pick_val(key, default=""):
+        if key in data and data[key] is not None:
+            return data[key]
+        return existing.get(key, default)
+
+    def pick_json(key):
+        if key in data and data[key] is not None:
+            val = data[key]
+            return json.dumps(val) if isinstance(val, (list, dict)) else str(val)
+        return existing.get(key, "[]")
+
+    education = pick_json("education")
+    work_exp = pick_json("work_experience")
+    skills = pick_json("skills")
+    projects = pick_json("projects")
+    certs = pick_json("certifications")
+
+    resume_path = data.get("resume_file_path") or existing.get("resume_file_path", "")
+    raw_resume = data.get("raw_resume_text") or existing.get("raw_resume_text", "")
+
     conn.execute("""
     INSERT INTO profiles (
-        id, full_name, email, phone, location, linkedin_url, github_url, portfolio_url,
-        summary, education, work_experience, skills, projects, certifications,
+        id, full_name, email, phone, phone_code, location, country, preferred_location,
+        linkedin_url, github_url, portfolio_url, summary,
+        total_experience_years, total_experience_months,
+        notice_period, notice_period_days,
+        current_salary, expected_salary, currency,
+        gender, pronouns, birth_date, referral_source,
+        education, work_experience, skills, projects, certifications,
         resume_file_path, raw_resume_text, updated_at, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (
+        ?, ?, ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?,
+        ?, ?,
+        ?, ?,
+        ?, ?, ?,
+        ?, ?, ?, ?,
+        ?, ?, ?, ?, ?,
+        ?, ?, ?, ?
+    )
     ON CONFLICT(id) DO UPDATE SET
         full_name=excluded.full_name,
         email=excluded.email,
         phone=excluded.phone,
+        phone_code=excluded.phone_code,
         location=excluded.location,
+        country=excluded.country,
+        preferred_location=excluded.preferred_location,
         linkedin_url=excluded.linkedin_url,
         github_url=excluded.github_url,
         portfolio_url=excluded.portfolio_url,
         summary=excluded.summary,
+        total_experience_years=excluded.total_experience_years,
+        total_experience_months=excluded.total_experience_months,
+        notice_period=excluded.notice_period,
+        notice_period_days=excluded.notice_period_days,
+        current_salary=excluded.current_salary,
+        expected_salary=excluded.expected_salary,
+        currency=excluded.currency,
+        gender=excluded.gender,
+        pronouns=excluded.pronouns,
+        birth_date=excluded.birth_date,
+        referral_source=excluded.referral_source,
         education=excluded.education,
         work_experience=excluded.work_experience,
         skills=excluded.skills,
@@ -223,26 +340,260 @@ def update_profile(data: Dict[str, Any]):
         updated_at=excluded.updated_at
     """, (
         profile_id,
-        data.get("full_name", ""),
-        data.get("email", ""),
-        data.get("phone", ""),
-        data.get("location", ""),
-        data.get("linkedin_url", ""),
-        data.get("github_url", ""),
-        data.get("portfolio_url", ""),
-        data.get("summary", ""),
+        pick_val("full_name"),
+        pick_val("email"),
+        pick_val("phone"),
+        pick_val("phone_code", "+91"),
+        pick_val("location"),
+        pick_val("country", "India"),
+        pick_val("preferred_location"),
+        pick_val("linkedin_url"),
+        pick_val("github_url"),
+        pick_val("portfolio_url"),
+        pick_val("summary"),
+        str(pick_val("total_experience_years")),
+        str(pick_val("total_experience_months")),
+        pick_val("notice_period"),
+        str(pick_val("notice_period_days")),
+        pick_val("current_salary"),
+        pick_val("expected_salary"),
+        pick_val("currency", "INR"),
+        pick_val("gender"),
+        pick_val("pronouns"),
+        pick_val("birth_date"),
+        pick_val("referral_source", "LinkedIn"),
         education,
         work_exp,
         skills,
         projects,
         certs,
-        data.get("resume_file_path", ""),
-        data.get("raw_resume_text", ""),
+        resume_path,
+        raw_resume,
         now,
-        now
+        existing.get("created_at", now)
     ))
     conn.commit()
     conn.close()
+
+REQUIRED_PROFILE_CHECKS = [
+    {
+        "key": "full_name",
+        "label": "Full Legal Name",
+        "category": "Basic Contact",
+        "type": "text",
+        "description": "Your full legal name as used in formal applications.",
+        "placeholder": "e.g. Muhammed Anees K"
+    },
+    {
+        "key": "email",
+        "label": "Email Address",
+        "category": "Basic Contact",
+        "type": "email",
+        "description": "Primary email for application confirmations.",
+        "placeholder": "e.g. your.email@example.com"
+    },
+    {
+        "key": "phone",
+        "label": "Phone Number",
+        "category": "Basic Contact",
+        "type": "tel",
+        "description": "Primary phone/mobile contact number.",
+        "placeholder": "e.g. 9876543210"
+    },
+    {
+        "key": "phone_code",
+        "label": "Phone Country Dial Code",
+        "category": "Basic Contact",
+        "type": "text",
+        "description": "Calling code prefix for international phone inputs.",
+        "placeholder": "e.g. +91"
+    },
+    {
+        "key": "location",
+        "label": "Current City & State",
+        "category": "Basic Contact",
+        "type": "text",
+        "description": "Your current residential location.",
+        "placeholder": "e.g. Kochi, Kerala, India"
+    },
+    {
+        "key": "country",
+        "label": "Country of Residence",
+        "category": "Basic Contact",
+        "type": "text",
+        "description": "Your primary country of residence.",
+        "placeholder": "e.g. India"
+    },
+    {
+        "key": "preferred_location",
+        "label": "Preferred Work Location",
+        "category": "Preferences & Availability",
+        "type": "text",
+        "description": "Where you prefer to work (e.g. Bangalore, Kochi, Remote).",
+        "placeholder": "e.g. Bangalore / Remote"
+    },
+    {
+        "key": "total_experience_years",
+        "label": "Total Experience (Years)",
+        "category": "Preferences & Availability",
+        "type": "number",
+        "description": "Total professional experience in full years (0 for freshers/students).",
+        "placeholder": "e.g. 0"
+    },
+    {
+        "key": "notice_period",
+        "label": "Notice Period / Availability",
+        "category": "Preferences & Availability",
+        "type": "select",
+        "options": ["Immediate", "15 Days", "30 Days", "60 Days", "90 Days"],
+        "description": "Time needed to join a new company.",
+        "placeholder": "Select notice period"
+    },
+    {
+        "key": "notice_period_days",
+        "label": "Notice Period (in Days)",
+        "category": "Preferences & Availability",
+        "type": "number",
+        "description": "Notice period expressed numerically in days (0 for immediate).",
+        "placeholder": "e.g. 0"
+    },
+    {
+        "key": "gender",
+        "label": "Gender",
+        "category": "Demographics & Diversity",
+        "type": "select",
+        "options": ["Male", "Female", "Non-binary", "Prefer not to say"],
+        "description": "Optional demographic question required by standard EEO/diversity forms.",
+        "placeholder": "Select gender"
+    },
+    {
+        "key": "pronouns",
+        "label": "Pronouns",
+        "category": "Demographics & Diversity",
+        "type": "select",
+        "options": ["he/him", "she/her", "they/them", "Prefer not to say"],
+        "description": "Preferred pronouns for communications.",
+        "placeholder": "Select pronouns"
+    },
+    {
+        "key": "current_salary",
+        "label": "Current Annual Salary / CTC",
+        "category": "Compensation",
+        "type": "text",
+        "description": "Current CTC in local currency (or 0 for freshers/students).",
+        "placeholder": "e.g. 0 or 1200000"
+    },
+    {
+        "key": "expected_salary",
+        "label": "Expected Annual Salary / CTC",
+        "category": "Compensation",
+        "type": "text",
+        "description": "Expected compensation target or range.",
+        "placeholder": "e.g. 1500000 or As per industry standards"
+    },
+    {
+        "key": "currency",
+        "label": "Preferred Currency",
+        "category": "Compensation",
+        "type": "select",
+        "options": ["INR", "USD", "EUR", "GBP"],
+        "description": "Currency for compensation numbers.",
+        "placeholder": "e.g. INR"
+    },
+    {
+        "key": "linkedin_url",
+        "label": "LinkedIn Profile URL",
+        "category": "Online Profiles",
+        "type": "url",
+        "description": "Public LinkedIn profile URL.",
+        "placeholder": "https://www.linkedin.com/in/..."
+    },
+    {
+        "key": "github_url",
+        "label": "GitHub Profile URL",
+        "category": "Online Profiles",
+        "type": "url",
+        "description": "Public GitHub profile URL.",
+        "placeholder": "https://github.com/..."
+    },
+    {
+        "key": "referral_source",
+        "label": "Default Application Source",
+        "category": "Preferences & Availability",
+        "type": "select",
+        "options": ["LinkedIn", "Company Career Website", "Referral", "Job Board", "Campus Placement"],
+        "description": "Default answer for 'How did you hear about this position?'.",
+        "placeholder": "Select source"
+    },
+    {
+        "key": "education",
+        "label": "Education Records",
+        "category": "Academic & Career History",
+        "type": "special",
+        "description": "At least one education record with degree, institution, and end year.",
+        "placeholder": ""
+    },
+    {
+        "key": "resume_file_path",
+        "label": "Resume Document File",
+        "category": "Documents",
+        "type": "special",
+        "description": "Uploaded PDF or DOCX resume document.",
+        "placeholder": ""
+    }
+]
+
+def calculate_profile_completeness(profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Computes profile completeness percentage and returns a structured list of missing items
+    so the user can be asked once to fill in any missing details needed for job applications.
+    """
+    if profile is None:
+        profile = get_profile()
+
+    evaluated = []
+    for check in REQUIRED_PROFILE_CHECKS:
+        k = check["key"]
+        val = profile.get(k)
+        is_filled = False
+
+        if k == "education":
+            if isinstance(val, list) and len(val) > 0:
+                first = val[0]
+                if isinstance(first, dict) and (first.get("degree") or first.get("institution")):
+                    is_filled = True
+        elif k == "resume_file_path":
+            if val and str(val).strip():
+                is_filled = True
+        elif val is not None:
+            s = str(val).strip()
+            # Allow "0" for numeric fields (e.g. 0 years experience, 0 days notice period)
+            if s != "":
+                is_filled = True
+
+        current_val = val if is_filled else ""
+        if isinstance(current_val, list):
+            current_val = f"{len(current_val)} items"
+
+        evaluated.append({
+            **check,
+            "is_filled": is_filled,
+            "current_value": str(current_val)
+        })
+
+    filled_count = sum(1 for item in evaluated if item["is_filled"])
+    total_count = len(evaluated)
+    score = int(round((filled_count / total_count) * 100)) if total_count > 0 else 100
+    missing_fields = [item for item in evaluated if not item["is_filled"]]
+
+    return {
+        "score": score,
+        "filled_count": filled_count,
+        "total_count": total_count,
+        "is_complete": score == 100,
+        "missing_fields": missing_fields,
+        "all_fields": evaluated
+    }
 
 def get_applications() -> List[Dict[str, Any]]:
     conn = get_db_connection()
@@ -251,7 +602,7 @@ def get_applications() -> List[Dict[str, Any]]:
     res = []
     for r in rows:
         d = dict(r)
-        for json_col in ["form_data", "unanswered_question", "unanswered_questions", "batch_answers", "logs"]:
+        for json_col in ["form_data", "unanswered_question", "unanswered_questions", "batch_answers", "logs", "verification_failures"]:
             if d.get(json_col):
                 try:
                     d[json_col] = json.loads(d[json_col])
@@ -267,7 +618,7 @@ def get_application(app_id: str) -> Optional[Dict[str, Any]]:
     if not row:
         return None
     d = dict(row)
-    for json_col in ["form_data", "unanswered_question", "unanswered_questions", "batch_answers", "logs"]:
+    for json_col in ["form_data", "unanswered_question", "unanswered_questions", "batch_answers", "logs", "verification_failures"]:
         if d.get(json_col):
             try:
                 d[json_col] = json.loads(d[json_col])
@@ -293,7 +644,7 @@ def update_application(app_id: str, updates: Dict[str, Any]):
     updates["updated_at"] = now
     
     # JSON serialize any dict/list fields
-    for field in ["form_data", "unanswered_question", "unanswered_questions", "batch_answers", "logs"]:
+    for field in ["form_data", "unanswered_question", "unanswered_questions", "batch_answers", "logs", "verification_failures"]:
         if field in updates and isinstance(updates[field], (dict, list)):
             updates[field] = json.dumps(updates[field])
             
@@ -397,6 +748,20 @@ def get_saved_answers() -> List[Dict[str, Any]]:
             d["question_key"] = generate_question_key(d.get("question_pattern") or d.get("normalized_text", ""), d.get("field_type", "text"), d.get("company_name", ""), d.get("scope", "global"))
         results.append(d)
     return results
+
+def get_saved_answer_by_id(ans_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_db_connection()
+    row = conn.execute("SELECT * FROM saved_answers WHERE id = ?", (ans_id,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    d = dict(row)
+    if isinstance(d.get("options_seen"), str):
+        try:
+            d["options_seen"] = json.loads(d["options_seen"])
+        except Exception:
+            d["options_seen"] = []
+    return d
 
 def create_saved_answer(
     pattern: str,
@@ -534,6 +899,89 @@ def get_worker_status() -> Dict[str, Any]:
     row = conn.execute("SELECT * FROM worker_status WHERE id = 'laptop-worker'").fetchone()
     conn.close()
     return dict(row) if row else {"id": "laptop-worker", "status": "offline"}
+
+def get_persisted_embeddings() -> Dict[str, np.ndarray]:
+    """Retrieve all persisted question pattern embeddings from SQLite."""
+    conn = get_db_connection()
+    rows = conn.execute("SELECT normalized_pattern, embedding, dim FROM embedding_cache").fetchall()
+    conn.close()
+    cache = {}
+    for r in rows:
+        try:
+            arr = np.frombuffer(r["embedding"], dtype=np.float32)
+            if arr.shape[0] == r["dim"]:
+                cache[r["normalized_pattern"]] = arr
+        except Exception:
+            pass
+    return cache
+
+def save_persisted_embedding(normalized_pattern: str, embedding: np.ndarray):
+    """Save an embedding vector to SQLite keyed by normalized_pattern."""
+    if not normalized_pattern or embedding is None:
+        return
+    conn = get_db_connection()
+    now = time.strftime('%Y-%m-%d %H:%M:%S')
+    blob = embedding.astype(np.float32).tobytes()
+    dim = int(embedding.shape[0])
+    conn.execute("""
+    INSERT INTO embedding_cache (normalized_pattern, embedding, dim, updated_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(normalized_pattern) DO UPDATE SET
+        embedding=excluded.embedding,
+        dim=excluded.dim,
+        updated_at=excluded.updated_at
+    """, (normalized_pattern, blob, dim, now))
+    conn.commit()
+    conn.close()
+
+def get_llm_cache(cache_key: str) -> Optional[Any]:
+    """Retrieve cached LLM result from persistent SQLite cache."""
+    if not cache_key:
+        return None
+    try:
+        conn = get_db_connection()
+        row = conn.execute("SELECT response_json FROM llm_cache WHERE cache_key = ?", (cache_key,)).fetchone()
+        conn.close()
+        if row and row["response_json"]:
+            return json.loads(row["response_json"])
+    except Exception as e:
+        print(f"[LLM Cache] Error reading cache key '{cache_key}': {e}")
+    return None
+
+def set_llm_cache(cache_key: str, cache_type: str, response: Any, prompt_hash: str = ""):
+    """Store LLM result in persistent SQLite cache."""
+    if not cache_key or response is None:
+        return
+    try:
+        conn = get_db_connection()
+        now = time.strftime('%Y-%m-%d %H:%M:%S')
+        resp_json = json.dumps(response, ensure_ascii=False)
+        conn.execute("""
+        INSERT INTO llm_cache (cache_key, cache_type, prompt_hash, response_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(cache_key) DO UPDATE SET
+            cache_type=excluded.cache_type,
+            prompt_hash=excluded.prompt_hash,
+            response_json=excluded.response_json,
+            created_at=excluded.created_at
+        """, (cache_key, cache_type, prompt_hash, resp_json, now))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[LLM Cache] Error writing cache key '{cache_key}': {e}")
+
+def clear_llm_cache(cache_type: Optional[str] = None):
+    """Clear LLM cache entries."""
+    try:
+        conn = get_db_connection()
+        if cache_type:
+            conn.execute("DELETE FROM llm_cache WHERE cache_type = ?", (cache_type,))
+        else:
+            conn.execute("DELETE FROM llm_cache")
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[LLM Cache] Error clearing cache: {e}")
 
 # Initialize DB on load
 init_db()

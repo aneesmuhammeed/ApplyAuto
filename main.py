@@ -11,9 +11,10 @@ from pydantic import BaseModel
 
 from config import settings
 from database import (
-    get_profile, update_profile, get_applications, get_application,
+    get_profile, update_profile, calculate_profile_completeness,
+    get_applications, get_application,
     create_application, update_application, delete_application,
-    get_saved_answers, create_saved_answer, delete_saved_answer,
+    get_saved_answers, create_saved_answer, update_saved_answer, delete_saved_answer,
     get_worker_status
 )
 from resume_parser import parse_resume
@@ -83,6 +84,8 @@ class UpdateApplicationRequest(BaseModel):
     save_answer_for_future: bool = False
     answer_category: str = "general"
     answer_scope: str = "global"
+    verification_confirmed: Optional[bool] = None
+    confirm_verification_failures: Optional[bool] = None
 
 class BatchAnswerItem(BaseModel):
     id: Optional[str] = None
@@ -106,6 +109,14 @@ class SavedAnswerRequest(BaseModel):
     scope: str = "global"
     company_name: str = ""
     field_type: str = "text"
+
+class UpdateSavedAnswerRequest(BaseModel):
+    question_pattern: Optional[str] = None
+    answer: Optional[str] = None
+    category: Optional[str] = None
+    scope: Optional[str] = None
+    company_name: Optional[str] = None
+    field_type: Optional[str] = None
 
 @app.get("/health")
 def health_check():
@@ -132,6 +143,19 @@ def get_app_detail(app_id: str):
 
 @app.patch("/api/applications/{app_id}")
 def update_app_task(app_id: str, req: UpdateApplicationRequest):
+    app_data = get_application(app_id)
+    if not app_data:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    # If submitting/approving, block approval if verification failed until explicitly confirmed!
+    if req.status == "submitting":
+        is_confirmed = bool(req.verification_confirmed or req.confirm_verification_failures)
+        if app_data.get("verification_failed") and not is_confirmed and not app_data.get("verification_confirmed"):
+            raise HTTPException(
+                status_code=400,
+                detail="Form fields failed verification re-read. Explicit user confirmation is required before approving submission."
+            )
+
     updates = {}
     if req.status is not None:
         updates["status"] = req.status
@@ -145,6 +169,10 @@ def update_app_task(app_id: str, req: UpdateApplicationRequest):
         updates["answer_category"] = req.answer_category
     if req.answer_scope is not None:
         updates["answer_scope"] = req.answer_scope
+    if req.verification_confirmed is not None:
+        updates["verification_confirmed"] = 1 if req.verification_confirmed else 0
+    if req.confirm_verification_failures is not None:
+        updates["verification_confirmed"] = 1 if req.confirm_verification_failures else 0
     
     update_application(app_id, updates)
     return {"status": "success"}
@@ -156,38 +184,21 @@ def answer_application_batch(app_id: str, req: BatchAnswerRequest):
         raise HTTPException(status_code=404, detail="Application not found")
 
     answers_list = [item.dict() for item in req.batch_answers]
-    company_name = app_data.get("company_name", "")
 
-    saved_count = 0
-    for ans in answers_list:
-        if ans.get("save_for_future") and ans.get("answer"):
-            try:
-                create_saved_answer(
-                    pattern=ans["label"],
-                    answer=ans["answer"],
-                    field_type=ans.get("type", "text"),
-                    category=ans.get("category", "general"),
-                    scope=ans.get("scope", "global"),
-                    company_name=company_name if ans.get("scope") in ["this company", "company"] else "",
-                    options_seen=ans.get("options", []),
-                    source="user"
-                )
-                saved_count += 1
-            except Exception as e:
-                print(f"[API Warning] Failed to save answer to memory: {e}")
-
+    # Queue answers for worker to apply through widget executors, verify in live DOM,
+    # and only then persist the verified option text to Answer Memory.
     update_application(app_id, {
         "status": "processing",
         "batch_answers": answers_list,
         "unanswered_questions": [],
         "unanswered_question": None,
-        "stage_message": f"Received {len(answers_list)} answers. Resuming autofill..."
+        "stage_message": f"Received {len(answers_list)} answers. Applying and verifying via widget executors..."
     })
 
     return {
         "status": "success",
-        "saved_count": len(answers_list),
-        "persisted_to_memory": saved_count
+        "received_count": len(answers_list),
+        "message": "Answers queued for worker verification and memory persistence."
     }
 
 @app.delete("/api/applications/{app_id}")
@@ -223,6 +234,14 @@ def remove_saved_answer(ans_id: str):
     delete_saved_answer(ans_id)
     return {"status": "success"}
 
+@app.patch("/api/saved-answers/{ans_id}")
+def edit_saved_answer(ans_id: str, req: UpdateSavedAnswerRequest):
+    updates = {k: v for k, v in req.dict().items() if v is not None}
+    if not updates:
+        return {"status": "noop", "message": "No updates provided"}
+    update_saved_answer(ans_id, updates)
+    return {"status": "success", "id": ans_id}
+
 # 4. Profile & Resume Endpoints
 @app.get("/api/profile")
 def fetch_profile():
@@ -231,7 +250,23 @@ def fetch_profile():
 @app.post("/api/profile")
 def save_profile(data: Dict[str, Any]):
     update_profile(data)
-    return {"status": "success"}
+    return {"status": "success", "profile": get_profile()}
+
+@app.get("/api/profile/completeness")
+def get_profile_completeness_status():
+    prof = get_profile()
+    return calculate_profile_completeness(prof)
+
+@app.post("/api/profile/completeness")
+def save_profile_completeness_items(data: Dict[str, Any]):
+    update_profile(data)
+    prof = get_profile()
+    comp = calculate_profile_completeness(prof)
+    return {
+        "status": "success",
+        "completeness": comp,
+        "profile": prof
+    }
 
 # Security: Strict resume upload policies
 MAX_RESUME_SIZE = 10 * 1024 * 1024  # 10 MB limit

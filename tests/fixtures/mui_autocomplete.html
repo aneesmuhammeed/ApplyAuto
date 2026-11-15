@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>MUI Autocomplete Component</title>
+  <style>
+    .MuiAutocomplete-root { width: 320px; font-family: sans-serif; }
+    .MuiInputBase-root { border: 1px solid #c4c4c4; border-radius: 4px; padding: 8px; }
+    .MuiAutocomplete-listbox { list-style: none; margin: 0; padding: 8px 0; max-height: 200px; overflow-y: auto; background: #fff; border: 1px solid #ccc; position: absolute; width: 320px; }
+    .MuiAutocomplete-option { padding: 6px 16px; cursor: pointer; }
+    .MuiAutocomplete-option:hover { background-color: rgba(0, 0, 0, 0.08); }
+  </style>
+</head>
+<body>
+  <form id="job-form">
+    <div class="MuiAutocomplete-root">
+      <div class="MuiFormControl-root">
+        <label id="mui-skill-label" for="mui-skill-input">Primary Programming Skill</label>
+        <div class="MuiInputBase-root">
+          <input
+            id="mui-skill-input"
+            type="text"
+            class="MuiInputBase-input MuiAutocomplete-input"
+            role="combobox"
+            aria-autocomplete="list"
+            aria-expanded="false"
+            aria-controls="mui-skill-listbox"
+            value=""
+          />
+        </div>
+      </div>
+    </div>
+  </form>
+
+  <div id="mui-portal">
+    <ul id="mui-skill-listbox" role="listbox" class="MuiAutocomplete-listbox" style="display: none;">
+      <li role="option" class="MuiAutocomplete-option" id="mui-opt-0" data-value="Python">Python</li>
+      <li role="option" class="MuiAutocomplete-option" id="mui-opt-1" data-value="TypeScript">TypeScript</li>
+      <li role="option" class="MuiAutocomplete-option" id="mui-opt-2" data-value="Go">Go</li>
+      <li role="option" class="MuiAutocomplete-option" id="mui-opt-3" data-value="Rust">Rust</li>
+    </ul>
+  </div>
+
+  <script>
+    const input = document.getElementById('mui-skill-input');
+    const listbox = document.getElementById('mui-skill-listbox');
+
+    function openMuiListbox() {
+      input.setAttribute('aria-expanded', 'true');
+      listbox.style.display = 'block';
+      const rect = input.getBoundingClientRect();
+      listbox.style.top = (rect.bottom + window.scrollY + 4) + 'px';
+      listbox.style.left = (rect.left + window.scrollX) + 'px';
+    }
+
+    input.addEventListener('click', openMuiListbox);
+    input.addEventListener('focus', openMuiListbox);
+
+    document.querySelectorAll('.MuiAutocomplete-option').forEach(opt => {
+      opt.addEventListener('click', function() {
+        const val = this.getAttribute('data-value');
+        input.value = val;
+        input.setAttribute('aria-expanded', 'false');
+        listbox.style.display = 'none';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+    });
+  </script>
+</body>
+</html>

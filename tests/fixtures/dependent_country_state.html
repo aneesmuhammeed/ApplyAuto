@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Dependent Country to State Dropdowns</title>
+</head>
+<body>
+  <form id="location-form">
+    <div>
+      <label for="country_select">Country</label>
+      <select id="country_select" name="country">
+        <option value="">-- Choose Country --</option>
+        <option value="India">India</option>
+        <option value="United States">United States</option>
+        <option value="Germany">Germany</option>
+      </select>
+    </div>
+
+    <br />
+
+    <div>
+      <label for="state_select">State / Province</label>
+      <select id="state_select" name="state" disabled>
+        <option value="">-- Select Country First --</option>
+      </select>
+    </div>
+  </form>
+
+  <script>
+    const countrySel = document.getElementById('country_select');
+    const stateSel = document.getElementById('state_select');
+
+    const stateMap = {
+      "India": ["Kerala", "Karnataka", "Maharashtra", "Tamil Nadu", "Delhi"],
+      "United States": ["California", "New York", "Texas", "Washington"],
+      "Germany": ["Bavaria", "Berlin", "Hesse", "Saxony"]
+    };
+
+    countrySel.addEventListener('change', function() {
+      const selected = this.value;
+      stateSel.innerHTML = '<option value="">-- Choose State --</option>';
+      if (selected && stateMap[selected]) {
+        stateSel.disabled = false;
+        stateMap[selected].forEach(st => {
+          const opt = document.createElement('option');
+          opt.value = st;
+          opt.textContent = st;
+          stateSel.appendChild(opt);
+        });
+      } else {
+        stateSel.disabled = true;
+      }
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Radio Groups With and Without Name</title>
+</head>
+<body>
+  <form id="radio-test-form">
+    <!-- Group 1: With name attribute -->
+    <fieldset id="group-with-name">
+      <legend>Are you authorized to work in the country of this role?</legend>
+      <label for="work_auth_yes">
+        <input type="radio" id="work_auth_yes" name="work_authorization" value="yes" /> Yes
+      </label>
+      <label for="work_auth_no">
+        <input type="radio" id="work_auth_no" name="work_authorization" value="no" /> No
+      </label>
+    </fieldset>
+
+    <br />
+
+    <!-- Group 2: Without name attribute, grouped by container -->
+    <div id="group-without-name" class="radio-group-container" role="radiogroup" aria-labelledby="relocate-heading">
+      <div id="relocate-heading">Are you willing to relocate?</div>
+      <label for="relocate_yes">
+        <input type="radio" id="relocate_yes" value="yes" /> Yes, willing to relocate
+      </label>
+      <label for="relocate_no">
+        <input type="radio" id="relocate_no" value="no" /> No, remote only
+      </label>
+    </div>
+  </form>
+
+  <script>
+    // Ensure mutually exclusive radio selection for radios without name in the same container
+    const nonameRadios = document.querySelectorAll('#group-without-name input[type="radio"]');
+    nonameRadios.forEach(r => {
+      r.addEventListener('change', function() {
+        if (this.checked) {
+          nonameRadios.forEach(other => {
+            if (other !== this) other.checked = false;
+          });
+        }
+      });
+    });
+  </script>
+</body>
+</html>

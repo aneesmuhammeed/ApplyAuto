@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Conditional Question Form</title>
+  <style>
+    .hidden { display: none; }
+    .visible { display: block; margin-top: 15px; }
+  </style>
+</head>
+<body>
+  <form id="visa-form">
+    <div id="initial-group">
+      <label for="visa_sponsorship">Will you now or in the future require visa sponsorship?</label>
+      <select id="visa_sponsorship" name="visa_sponsorship">
+        <option value="">-- please select --</option>
+        <option value="Yes">Yes</option>
+        <option value="No">No</option>
+      </select>
+    </div>
+
+    <!-- Conditional group revealed only when answering 'Yes' -->
+    <div id="conditional-visa-group" class="hidden">
+      <label for="current_visa_status">Please specify your current visa category and expiry</label>
+      <input type="text" id="current_visa_status" name="current_visa_status" required />
+    </div>
+  </form>
+
+  <script>
+    const visaSel = document.getElementById('visa_sponsorship');
+    const condGroup = document.getElementById('conditional-visa-group');
+
+    visaSel.addEventListener('change', function() {
+      if (this.value === 'Yes') {
+        condGroup.className = 'visible';
+      } else {
+        condGroup.className = 'hidden';
+      }
+    });
+  </script>
+</body>
+</html>

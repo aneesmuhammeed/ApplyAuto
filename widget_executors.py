@@ -2,9 +2,103 @@ import os
 import re
 import time
 import asyncio
+from datetime import datetime, date
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional, Tuple, Union
 from playwright.async_api import Page, Frame, ElementHandle
+
+# Word-boundary matcher for known calendar / datepicker classes (prevents matching 'candidate' or 'update')
+KNOWN_DATE_PICKER_CLASSES = re.compile(
+    r'\b(flatpickr|(ui-)?datepicker|date-picker|hasdatepicker|p-datepicker|bs-datepicker|air-datepicker|pikaday|react-datepicker|calendar-picker|mat-datepicker|ant-picker)(__|-|\b)',
+    re.IGNORECASE
+)
+
+def parse_date_value(val: Any, preferred_format: Optional[str] = None) -> Optional[date]:
+    """Parse various date formats into a datetime.date object. Returns None on invalid date."""
+    if not val:
+        return None
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, date):
+        return val
+
+    s = str(val).strip()
+    if not s:
+        return None
+
+    # If preferred_format is given, test it first
+    if preferred_format:
+        try:
+            return datetime.strptime(s, preferred_format).date()
+        except ValueError:
+            pass
+
+    formats = [
+        "%Y-%m-%d",
+        "%d/%m/%Y",
+        "%m/%d/%Y",
+        "%Y/%m/%d",
+        "%d-%m-%Y",
+        "%m-%d-%Y",
+        "%d.%m.%Y",
+        "%b %Y",       # "May 2024"
+        "%B %Y",       # "August 2024"
+        "%Y-%m",       # "2024-05"
+        "%m/%Y",       # "05/2024"
+        "%m-%Y",
+        "%d %b %Y",    # "15 May 2024"
+        "%d %B %Y",    # "15 August 2024"
+        "%b %d, %Y",   # "May 15, 2024"
+        "%B %d, %Y",   # "August 15, 2024"
+    ]
+
+    for fmt in formats:
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            pass
+
+    return None
+
+def format_date_for_element(d: date, inp_type: str, placeholder: str) -> str:
+    """Format date according to element type and placeholder hint (dd/mm/yyyy, mm/dd/yyyy, yyyy-mm-dd, MMM yyyy)."""
+    ph = (placeholder or "").strip().lower()
+    inp_t = (inp_type or "").strip().lower()
+
+    # 1. Native inputs
+    if inp_t == "date":
+        return f"{d.year:04d}-{d.month:02d}-{d.day:02d}"
+    if inp_t == "month":
+        return f"{d.year:04d}-{d.month:02d}"
+
+    # 2. 3-part date formats (must be evaluated before 2-part to prevent mm/yyyy matching within dd/mm/yyyy)
+    if re.search(r'\bmm[/-]dd[/-]yyyy\b', ph) or re.search(r'\bm[/-]d[/-]y\b', ph):
+        sep = "/" if "/" in ph else "-"
+        return f"{d.month:02d}{sep}{d.day:02d}{sep}{d.year:04d}"
+
+    if re.search(r'\bdd[/-]mm[/-]yyyy\b', ph) or re.search(r'\bd[/-]m[/-]y\b', ph):
+        sep = "/" if "/" in ph else "-"
+        return f"{d.day:02d}{sep}{d.month:02d}{sep}{d.year:04d}"
+
+    if re.search(r'\byyyy[/-]mm[/-]dd\b', ph):
+        sep = "-" if "-" in ph else "/"
+        return f"{d.year:04d}{sep}{d.month:02d}{sep}{d.day:02d}"
+
+    # 3. 2-part month-year formats (only if "day" or "dd" is NOT in placeholder)
+    if not re.search(r'(\bdd\b|\bd\b|day)', ph):
+        if re.search(r'\b(mmm\s*yyyy|month\s*yyyy|month,\s*year)\b', ph) or ph in ["mmm yyyy", "month yyyy"]:
+            return f"{d.strftime('%B')} {d.year:04d}"
+
+        if re.search(r'\bmm[/-]yyyy\b', ph):
+            sep = "/" if "/" in ph else "-"
+            return f"{d.month:02d}{sep}{d.year:04d}"
+
+        if re.search(r'\byyyy[/-]mm\b', ph):
+            sep = "-" if "-" in ph else "/"
+            return f"{d.year:04d}{sep}{d.month:02d}"
+
+    # Default to standard DD/MM/YYYY
+    return f"{d.day:02d}/{d.month:02d}/{d.year:04d}"
 
 class WidgetType:
     TEXT = "text"
@@ -167,6 +261,148 @@ class TextWidgetExecutor(BaseWidgetExecutor):
         return False, curr_clean
 
 # =========================================================================
+# ROBUST MULTI-STAGE OPTION MATCHER
+# =========================================================================
+def match_option_candidate(
+    target: Any,
+    candidates: List[Tuple[Any, str]],  # [(item, text), ...]
+    threshold: float = 0.75
+) -> Optional[Tuple[Any, str]]:
+    """
+    Harden matching across dropdowns, comboboxes, and radio groups.
+    Stages:
+      1. Exact match (case-insensitive)
+      2. Normalized match (punctuation stripped, whitespace collapsed)
+      3. Boolean equivalence (Yes/No with affirmative/negative tokens, explicitly rejecting "Not applicable")
+      4. Token-based fuzzy matching with score threshold (rejecting ties)
+
+    Rules:
+      - Never allows substring containment like 'male' matching 'Female' or 'no' matching 'Not applicable'.
+      - Ties between distinct options return failure (None).
+      - Returns None if no candidates meet threshold.
+    """
+    if target is None:
+        return None
+    target_str = str(target).strip()
+    if not target_str:
+        return None
+
+    t_low = target_str.lower()
+    t_norm = " ".join(re.sub(r'[^\w\s]', '', t_low).split())
+    t_tokens = [tok for tok in re.findall(r'\b\w+\b', t_low) if tok]
+    t_tokens_set = set(t_tokens)
+
+    # Filter out empty or placeholder candidates
+    valid_cands: List[Tuple[Any, str]] = []
+    for item, raw_text in candidates:
+        txt = (str(raw_text) if raw_text is not None else "").strip()
+        if not txt:
+            continue
+        txt_low = txt.lower()
+        if txt_low in ["select", "select an option", "select...", "-- select --", "choose", "please select"]:
+            continue
+        valid_cands.append((item, txt))
+
+    if not valid_cands:
+        return None
+
+    # Stage 1: Exact match (case-insensitive)
+    exact_matches = [c for c in valid_cands if c[1].strip().lower() == t_low]
+    if exact_matches:
+        distinct_texts = {c[1].strip().lower() for c in exact_matches}
+        if len(distinct_texts) == 1:
+            return exact_matches[0]
+        return None  # Ambiguous tie
+
+    # Stage 2: Normalized match (alphanumeric only, collapsed spaces)
+    if t_norm:
+        norm_matches = []
+        for c in valid_cands:
+            c_norm = " ".join(re.sub(r'[^\w\s]', '', c[1].lower()).split())
+            if c_norm == t_norm:
+                norm_matches.append(c)
+        if norm_matches:
+            distinct_texts = {c[1].strip().lower() for c in norm_matches}
+            if len(distinct_texts) == 1:
+                return norm_matches[0]
+            return None  # Tie between distinct normalized options
+
+    # Stage 3: Boolean normalization (strict Yes / No handling)
+    is_target_yes = t_low in ["yes", "true", "y", "authorized", "eligible", "agree", "accept"]
+    is_target_no = t_low in ["no", "false", "n", "not authorized", "not eligible", "disagree"]
+
+    if is_target_yes:
+        yes_matches = []
+        for c in valid_cands:
+            c_tokens = set(re.findall(r'\b\w+\b', c[1].lower()))
+            has_affirmative = bool(c_tokens & {"yes", "true", "y", "authorized", "eligible", "agree"})
+            has_negative = bool(c_tokens & {"not", "no", "never", "unauthorized", "ineligible", "none"})
+            if has_affirmative and not has_negative:
+                yes_matches.append(c)
+        if yes_matches:
+            exact_yes = [m for m in yes_matches if m[1].strip().lower() in ["yes", "true", "y"]]
+            if len(exact_yes) == 1:
+                return exact_yes[0]
+            distinct_texts = {c[1].strip().lower() for c in yes_matches}
+            if len(distinct_texts) == 1:
+                return yes_matches[0]
+            return None  # Tie
+
+    if is_target_no:
+        no_matches = []
+        for c in valid_cands:
+            c_tokens = set(re.findall(r'\b\w+\b', c[1].lower()))
+            # Explicitly reject "not applicable" or "none"
+            if c_tokens & {"applicable", "none"}:
+                continue
+            has_negative = bool(c_tokens & {"no", "false", "n", "never", "unauthorized", "ineligible", "disagree"}) or bool(re.match(r'^no\b', c[1].strip().lower()))
+            if has_negative:
+                no_matches.append(c)
+        if no_matches:
+            exact_no = [m for m in no_matches if m[1].strip().lower() in ["no", "false", "n"]]
+            if len(exact_no) == 1:
+                return exact_no[0]
+            distinct_texts = {c[1].strip().lower() for c in no_matches}
+            if len(distinct_texts) == 1:
+                return no_matches[0]
+            return None  # Tie
+
+    # Stage 4: Token-based fuzzy matching with score threshold and tie rejection
+    if not t_tokens_set:
+        return None
+
+    scored_cands: List[Tuple[float, Any, str]] = []
+    for item, txt in valid_cands:
+        c_tokens = set(re.findall(r'\b\w+\b', txt.lower()))
+        if not c_tokens:
+            continue
+        intersection = t_tokens_set & c_tokens
+        if not intersection:
+            continue
+
+        recall = len(intersection) / len(t_tokens_set)
+        token_f1 = (2.0 * len(intersection)) / (len(t_tokens_set) + len(c_tokens))
+        score = 0.6 * recall + 0.4 * token_f1
+
+        if score >= threshold:
+            scored_cands.append((score, item, txt))
+
+    if not scored_cands:
+        return None
+
+    scored_cands.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_item, best_txt = scored_cands[0]
+
+    # Check for ties between distinct options
+    if len(scored_cands) > 1:
+        second_score, second_item, second_txt = scored_cands[1]
+        if abs(best_score - second_score) < 0.02:
+            if best_txt.strip().lower() != second_txt.strip().lower():
+                return None  # Failure on tie
+
+    return (best_item, best_txt)
+
+# =========================================================================
 # 2. NATIVE SELECT WIDGET EXECUTOR
 # =========================================================================
 class NativeSelectWidgetExecutor(BaseWidgetExecutor):
@@ -176,7 +412,8 @@ class NativeSelectWidgetExecutor(BaseWidgetExecutor):
         if value is None:
             return False
         target = str(value).strip()
-        t_low = target.lower()
+        if not target:
+            return False
 
         # Extract available options
         options_data = await element.evaluate("""sel => {
@@ -187,48 +424,25 @@ class NativeSelectWidgetExecutor(BaseWidgetExecutor):
             }));
         }""")
 
-        chosen_val = None
-        chosen_label = None
+        candidates = [
+            (opt, opt["text"] if opt["text"] else opt["value"])
+            for opt in options_data
+            if (opt["text"] or opt["value"])
+        ]
 
-        # 1. Exact text match
-        for opt in options_data:
-            if opt["text"].lower() == t_low or opt["value"].lower() == t_low:
-                chosen_val = opt["value"]
-                chosen_label = opt["text"]
-                break
+        match = match_option_candidate(target, candidates)
+        if not match:
+            return False
 
-        # 2. Boolean normalization (Yes/No)
-        if not chosen_val:
-            if t_low in ["yes", "true", "y"]:
-                for opt in options_data:
-                    if opt["text"].lower() in ["yes", "true", "y", "authorized", "eligible"]:
-                        chosen_val = opt["value"]
-                        chosen_label = opt["text"]
-                        break
-            elif t_low in ["no", "false", "n"]:
-                for opt in options_data:
-                    if opt["text"].lower() in ["no", "false", "n", "not authorized"]:
-                        chosen_val = opt["value"]
-                        chosen_label = opt["text"]
-                        break
+        chosen_opt, _ = match
+        chosen_val = chosen_opt["value"]
+        chosen_label = chosen_opt["text"]
 
-        # 3. Substring match
-        if not chosen_val:
-            for opt in options_data:
-                o_low = opt["text"].lower()
-                if t_low in o_low or o_low in t_low:
-                    chosen_val = opt["value"]
-                    chosen_label = opt["text"]
-                    break
-
-        if chosen_val is not None:
+        try:
+            await element.select_option(value=chosen_val, timeout=2500)
+        except Exception:
             try:
-                await element.select_option(value=chosen_val, timeout=2500)
-            except Exception:
                 await element.select_option(label=chosen_label, timeout=2500)
-        else:
-            try:
-                await element.select_option(label=target, timeout=2000)
             except Exception:
                 return False
 
@@ -239,20 +453,29 @@ class NativeSelectWidgetExecutor(BaseWidgetExecutor):
         return True
 
     async def fallback_fill(self, ctx: Union[Page, Frame], element: ElementHandle, value: Any, **kwargs):
-        target = str(value).lower().strip()
-        await element.evaluate("""(sel, target) => {
-            for (let i = 0; i < sel.options.length; i++) {
-                const t = sel.options[i].text.toLowerCase().trim();
-                const v = sel.options[i].value.toLowerCase().trim();
-                if (t === target || v === target || t.includes(target) || target.includes(t)) {
-                    sel.selectedIndex = i;
-                    sel.dispatchEvent(new Event('input', { bubbles: true }));
-                    sel.dispatchEvent(new Event('change', { bubbles: true }));
-                    return true;
-                }
-            }
-            return false;
-        }""", target)
+        target = str(value).strip()
+        if not target:
+            return
+        options_data = await element.evaluate("""sel => {
+            return Array.from(sel.options).map((opt, idx) => ({
+                index: idx,
+                value: opt.value,
+                text: opt.text.trim()
+            }));
+        }""")
+        candidates = [
+            (opt, opt["text"] if opt["text"] else opt["value"])
+            for opt in options_data
+            if (opt["text"] or opt["value"])
+        ]
+        match = match_option_candidate(target, candidates)
+        if match:
+            idx = match[0]["index"]
+            await element.evaluate("""(sel, idx) => {
+                sel.selectedIndex = idx;
+                sel.dispatchEvent(new Event('input', { bubbles: true }));
+                sel.dispatchEvent(new Event('change', { bubbles: true }));
+            }""", idx)
 
     async def verify(self, ctx: Union[Page, Frame], element: ElementHandle, expected_value: Any, **kwargs) -> Tuple[bool, Optional[str]]:
         """Re-reads the currently selected option from the native select in DOM."""
@@ -269,27 +492,21 @@ class NativeSelectWidgetExecutor(BaseWidgetExecutor):
 
         curr_text = sel_info.get("text", "")
         curr_val = sel_info.get("value", "")
-        exp_low = str(expected_value).strip().lower()
+        display_val = curr_text or curr_val
 
-        if not curr_text and not curr_val:
+        if not display_val:
             return False, ""
 
         # Placeholder checks
-        if curr_text.lower() in ["select", "select an option", "select...", "-- select --", "choose", ""]:
-            return False, curr_text
+        if display_val.lower() in ["select", "select an option", "select...", "-- select --", "choose", ""]:
+            return False, display_val
 
-        # Exact or substring match against text or value
-        if (exp_low in curr_text.lower() or curr_text.lower() in exp_low or
-            exp_low in curr_val.lower() or curr_val.lower() in exp_low):
-            return True, curr_text
+        # Exact, normalized, token match against expected_value
+        match = match_option_candidate(expected_value, [(display_val, display_val)])
+        if match:
+            return True, display_val
 
-        # Boolean equivalence
-        if exp_low in ["yes", "true", "y"] and curr_text.lower() in ["yes", "true", "y", "authorized"]:
-            return True, curr_text
-        if exp_low in ["no", "false", "n"] and curr_text.lower() in ["no", "false", "n", "not authorized"]:
-            return True, curr_text
-
-        return False, curr_text
+        return False, display_val
 
 # =========================================================================
 # 3. CUSTOM COMBOBOX WIDGET EXECUTOR
@@ -301,85 +518,157 @@ class CustomComboboxWidgetExecutor(BaseWidgetExecutor):
         if value is None:
             return False
         target = str(value).strip()
-        t_low = target.lower()
+        if not target:
+            return False
+
+        page = ctx.page if hasattr(ctx, "page") else ctx
 
         # Find trigger control (React-Select, Select2, or ARIA combobox)
         parent_container = await element.evaluate_handle(
-            """el => el.closest('.select__container, .select, [class*="select"], .select2-container, [role="combobox"]') || el"""
+            """el => {
+                const outer = el.closest('.select__container, .select, [class*="select"], .select2-container, [class*="MuiAutocomplete-root"], [role="combobox"]');
+                if (outer && outer !== el) return outer;
+                return el.parentElement || el;
+            }"""
         )
-        control = await parent_container.query_selector(".select__control, .select2-selection") if parent_container else None
-        trigger = control or element
+        control = await parent_container.query_selector(".select__control, .select2-selection, [class*='select__control']") if parent_container else None
+        input_el = await parent_container.query_selector("input") if parent_container else None
+        trigger = control or input_el or element
 
+        # 1. Open popup
         try:
-            await trigger.click()
-            await asyncio.sleep(0.3)
+            await trigger.click(timeout=1500)
         except Exception:
             pass
+        if input_el and input_el != trigger:
+            try:
+                await input_el.click(timeout=1000)
+            except Exception:
+                pass
 
-        # Locate popup listbox
-        page = ctx.page if hasattr(ctx, "page") else ctx
-        listbox = await ctx.query_selector('.select__menu, [role="listbox"], .select2-results__options, [class*="MuiAutocomplete-popper"], [class*="dropdown"]')
-        if not listbox and hasattr(page, "query_selector"):
-            listbox = await page.query_selector('.select__menu, [role="listbox"], .select2-results__options, [class*="MuiAutocomplete-popper"], [class*="dropdown"]')
+        # 2. Locate listbox tied through aria-controls or aria-owns
+        listbox = None
+        listbox_id = await element.evaluate("""el => {
+            const inp = el.tagName && el.tagName.toLowerCase() === 'input' ? el : el.querySelector('input');
+            if (inp) {
+                const c = inp.getAttribute('aria-controls') || inp.getAttribute('aria-owns');
+                if (c) return c;
+            }
+            return el.getAttribute('aria-controls') || el.getAttribute('aria-owns');
+        }""")
 
-        # If searchable input exists, type to filter
-        search_inp = await element.query_selector('input') or (element if await element.evaluate("e => e.tagName.toLowerCase() === 'input'") else None)
+        if listbox_id:
+            try:
+                listbox = await ctx.query_selector(f"#{listbox_id}")
+                if not listbox and hasattr(page, "query_selector"):
+                    listbox = await page.query_selector(f"#{listbox_id}")
+            except Exception:
+                listbox = None
+
+        if not listbox:
+            # Fallback to standard combobox listbox containers (avoiding broad [class*="dropdown"] or generic li)
+            listbox = await ctx.query_selector('.select__menu, [role="listbox"], .select2-results__options, [class*="MuiAutocomplete-popper"] [role="listbox"], [class*="MuiAutocomplete-listbox"]')
+            if not listbox and hasattr(page, "query_selector"):
+                listbox = await page.query_selector('.select__menu, [role="listbox"], .select2-results__options, [class*="MuiAutocomplete-popper"] [role="listbox"], [class*="MuiAutocomplete-listbox"]')
+
+        # 3. If searchable input exists, type to filter
+        search_inp = await element.query_selector('input') or (element if await element.evaluate("e => e.tagName && e.tagName.toLowerCase() === 'input'") else None)
         if search_inp:
             try:
                 await search_inp.fill(target)
-                await asyncio.sleep(0.3)
             except Exception:
                 pass
 
-        # Search for matching option element in listbox
+        # 4. Wait for [role="option"] with timeout instead of fixed sleeps
         if listbox:
-            opt_els = await listbox.query_selector_all('[role="option"], .select__option, .select2-results__option, li')
-            for opt in opt_els:
-                txt = (await opt.inner_text() or "").strip()
-                if txt.lower() == t_low or (t_low in txt.lower()) or (t_low == "yes" and txt.lower().startswith("yes")) or (t_low == "no" and txt.lower().startswith("no")):
-                    await opt.scroll_into_view_if_needed()
-                    await opt.click()
-                    await asyncio.sleep(0.2)
-                    return True
-
-        # Fallback: press Enter on search input
-        if search_inp:
             try:
-                await search_inp.press("Enter")
-                await asyncio.sleep(0.2)
-                return True
+                await listbox.wait_for_selector('[role="option"], .select__option, .select2-results__option', timeout=2500)
             except Exception:
                 pass
 
+        # 5. Collect options and handle virtualized scrolling
+        if listbox:
+            collected_options: Dict[str, Tuple[ElementHandle, str]] = {}
+
+            async def scan_options():
+                opt_els = await listbox.query_selector_all('[role="option"], .select__option, .select2-results__option')
+                for opt in opt_els:
+                    txt = (await opt.inner_text() or "").strip()
+                    if txt and txt not in collected_options:
+                        collected_options[txt] = (opt, txt)
+
+            await scan_options()
+
+            # First check among visible options
+            match = match_option_candidate(target, list(collected_options.values()))
+            if match:
+                matched_opt, _ = match
+                await matched_opt.scroll_into_view_if_needed()
+                try:
+                    await matched_opt.click(timeout=2000)
+                except Exception:
+                    await matched_opt.evaluate("el => el.click()")
+                return True
+
+            # If not found, scroll the popup to collect virtualized options
+            can_scroll = await listbox.evaluate("el => el.scrollHeight > el.clientHeight")
+            if can_scroll:
+                for _ in range(3):
+                    await listbox.evaluate("el => { el.scrollTop = (el.scrollTop || 0) + (el.clientHeight || 200); el.dispatchEvent(new Event('scroll')); }")
+                    try:
+                        await listbox.wait_for_selector('[role="option"], .select__option, .select2-results__option', timeout=600)
+                    except Exception:
+                        pass
+                    await scan_options()
+                    match = match_option_candidate(target, list(collected_options.values()))
+                    if match:
+                        matched_opt, _ = match
+                        await matched_opt.scroll_into_view_if_needed()
+                        try:
+                            await matched_opt.click(timeout=2000)
+                        except Exception:
+                            await matched_opt.evaluate("el => el.click()")
+                        return True
+
+        # Unverified Enter fallback removed! If no option matches, return False.
         return False
 
     async def verify(self, ctx: Union[Page, Frame], element: ElementHandle, expected_value: Any, **kwargs) -> Tuple[bool, Optional[str]]:
         """Re-reads the currently displayed text inside the custom combobox."""
         parent_container = await element.evaluate_handle(
-            """el => el.closest('.select__container, .select, [class*="select"], .select2-container, [role="combobox"]') || el"""
+            """el => {
+                const outer = el.closest('.select__container, .select, [class*="select"], .select2-container, [class*="MuiAutocomplete-root"], [role="combobox"]');
+                if (outer && outer !== el) return outer;
+                return el.parentElement || el;
+            }"""
         )
-        
-        # Read text from display container
+
         selected_text = await parent_container.evaluate("""container => {
+            if (container.tagName && container.tagName.toLowerCase() === 'input') {
+                return container.value ? container.value.trim() : '';
+            }
             const single = container.querySelector('.select__single-value, [class*="singleValue"], .select2-selection__rendered, [class*="selection__rendered"], [class*="MuiAutocomplete-tag"]');
-            if (single) return single.innerText.trim();
+            if (single && single.innerText.trim()) return single.innerText.trim();
             const inp = container.querySelector('input');
-            if (inp && inp.value && !inp.placeholder) return inp.value.trim();
+            if (inp && inp.value && inp.value.trim()) return inp.value.trim();
             return container.innerText.trim();
         }""")
 
-        exp_low = str(expected_value).strip().lower()
         curr_clean = (selected_text or "").strip()
+        if not curr_clean:
+            try:
+                curr_clean = (await element.input_value() or "").strip()
+            except Exception:
+                pass
 
         if not curr_clean:
             return False, ""
 
-        if exp_low in curr_clean.lower() or curr_clean.lower() in exp_low:
-            return True, curr_clean
+        if curr_clean.lower() in ["select", "select an option", "select...", "-- select --", "choose", ""]:
+            return False, curr_clean
 
-        if exp_low in ["yes", "true", "y"] and curr_clean.lower().startswith("yes"):
-            return True, curr_clean
-        if exp_low in ["no", "false", "n"] and curr_clean.lower().startswith("no"):
+        match = match_option_candidate(expected_value, [(curr_clean, curr_clean)])
+        if match:
             return True, curr_clean
 
         return False, curr_clean
@@ -393,15 +682,17 @@ class RadioWidgetExecutor(BaseWidgetExecutor):
     async def fill(self, ctx: Union[Page, Frame], element: ElementHandle, value: Any, **kwargs) -> bool:
         if value is None:
             return False
-        target = str(value).strip().lower()
+        target = str(value).strip()
+        if not target:
+            return False
         name = await element.get_attribute("name") or ""
 
         # Find all sibling radios in the group
         group_radios = await ctx.query_selector_all(f'input[type="radio"][name="{name}"]') if name else [element]
 
+        candidates: List[Tuple[ElementHandle, str]] = []
         for r_el in group_radios:
-            r_val = (await r_el.get_attribute("value") or "").strip().lower()
-            # Get associated label
+            r_val = (await r_el.get_attribute("value") or "").strip()
             r_lbl = await r_el.evaluate("""r => {
                 if (r.id) {
                     const l = document.querySelector(`label[for="${r.id}"]`);
@@ -411,49 +702,68 @@ class RadioWidgetExecutor(BaseWidgetExecutor):
                 if (p) return p.innerText.trim();
                 return r.value || '';
             }""")
-            r_lbl = (r_lbl or "").strip().lower()
+            display_val = (r_lbl or r_val or "").strip()
+            # Stop matching empty labels!
+            if not display_val:
+                continue
+            candidates.append((r_el, display_val))
 
-            matched = (
-                r_val == target or r_lbl == target or
-                (target in ["yes", "true", "y"] and (r_val.startswith("yes") or r_lbl.startswith("yes"))) or
-                (target in ["no", "false", "n"] and (r_val.startswith("no") or r_lbl.startswith("no"))) or
-                (target in r_lbl or r_lbl in target)
-            )
+        match = match_option_candidate(target, candidates)
+        if not match:
+            return False
 
-            if matched:
-                await r_el.scroll_into_view_if_needed()
-                await r_el.click()
-                await r_el.evaluate("""r => {
-                    r.dispatchEvent(new Event('input', { bubbles: true }));
-                    r.dispatchEvent(new Event('change', { bubbles: true }));
-                }""")
-                return True
-
-        return False
+        matched_el, _ = match
+        await matched_el.scroll_into_view_if_needed()
+        await matched_el.click()
+        await matched_el.evaluate("""r => {
+            r.dispatchEvent(new Event('input', { bubbles: true }));
+            r.dispatchEvent(new Event('change', { bubbles: true }));
+        }""")
+        return True
 
     async def fallback_fill(self, ctx: Union[Page, Frame], element: ElementHandle, value: Any, **kwargs):
+        target = str(value).strip()
+        if not target:
+            return
         name = await element.get_attribute("name") or ""
         group_radios = await ctx.query_selector_all(f'input[type="radio"][name="{name}"]') if name else [element]
-        target = str(value).strip().lower()
 
+        candidates: List[Tuple[ElementHandle, str]] = []
         for r_el in group_radios:
-            r_val = (await r_el.get_attribute("value") or "").strip().lower()
-            if target in r_val or r_val in target:
-                await r_el.evaluate("""r => {
-                    r.checked = true;
-                    r.dispatchEvent(new Event('input', { bubbles: true }));
-                    r.dispatchEvent(new Event('change', { bubbles: true }));
-                }""")
-                break
+            r_val = (await r_el.get_attribute("value") or "").strip()
+            r_lbl = await r_el.evaluate("""r => {
+                if (r.id) {
+                    const l = document.querySelector(`label[for="${r.id}"]`);
+                    if (l) return l.innerText.trim();
+                }
+                const p = r.closest('label');
+                if (p) return p.innerText.trim();
+                return r.value || '';
+            }""")
+            display_val = (r_lbl or r_val or "").strip()
+            if display_val:
+                candidates.append((r_el, display_val))
+
+        match = match_option_candidate(target, candidates)
+        if match:
+            matched_el, _ = match
+            await matched_el.evaluate("""r => {
+                r.checked = true;
+                r.dispatchEvent(new Event('input', { bubbles: true }));
+                r.dispatchEvent(new Event('change', { bubbles: true }));
+            }""")
 
     async def verify(self, ctx: Union[Page, Frame], element: ElementHandle, expected_value: Any, **kwargs) -> Tuple[bool, Optional[str]]:
-        """Re-reads whether any radio in the group is checked and matches expected value."""
+        """Re-reads whether the specific checked radio matches expected value."""
         name = await element.get_attribute("name") or ""
         group_radios = await ctx.query_selector_all(f'input[type="radio"][name="{name}"]') if name else [element]
-        target = str(expected_value).strip().lower()
+        target = str(expected_value).strip()
 
+        checked_radio = None
+        display_val = ""
         for r_el in group_radios:
             if await r_el.is_checked():
+                checked_radio = r_el
                 r_val = (await r_el.get_attribute("value") or "").strip()
                 r_lbl = await r_el.evaluate("""r => {
                     if (r.id) {
@@ -464,16 +774,22 @@ class RadioWidgetExecutor(BaseWidgetExecutor):
                     if (p) return p.innerText.trim();
                     return r.value || '';
                 }""")
-                display_val = r_lbl or r_val
-                disp_low = display_val.lower().strip()
+                display_val = (r_lbl or r_val or "").strip()
+                break
 
-                if (disp_low == target or target in disp_low or
-                    (target in ["yes", "true", "y"] and disp_low.startswith("yes")) or
-                    (target in ["no", "false", "n"] and disp_low.startswith("no"))):
-                    return True, display_val
-                return True, display_val # A radio is checked
+        if not checked_radio:
+            return False, "None checked"
 
-        return False, "None checked"
+        if not display_val:
+            return False, "Checked radio has no label or value"
+
+        # Check that the checked radio specifically matches expected value
+        match = match_option_candidate(target, [(checked_radio, display_val)])
+        if match:
+            return True, display_val
+
+        # STOP returning True when any radio is checked!
+        return False, display_val
 
 # =========================================================================
 # 5. CHECKBOX WIDGET EXECUTOR
@@ -524,47 +840,105 @@ class DateWidgetExecutor(BaseWidgetExecutor):
     async def fill(self, ctx: Union[Page, Frame], element: ElementHandle, value: Any, **kwargs) -> bool:
         if value is None:
             return False
-        date_str = str(value).strip()
 
-        # Format to YYYY-MM-DD if needed
-        match = re.search(r'(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})', date_str)
-        if match:
-            y, m, d = match.groups()
-            date_str = f"{y}-{int(m):02d}-{int(d):02d}"
+        parsed_d = parse_date_value(value)
+        if not parsed_d:
+            print(f"[DateWidgetExecutor] Invalid date value: '{value}', returning failure.")
+            return False
+
+        inp_type = (await element.get_attribute("type") or "").lower()
+        ph = (await element.get_attribute("placeholder") or "").lower()
+
+        # Format date according to detected format from placeholder and element type
+        formatted_val = format_date_for_element(parsed_d, inp_type, ph)
+
+        # Remove readonly if present on calendar inputs
+        await element.evaluate("el => el.removeAttribute('readonly')")
 
         await element.focus()
-        await element.fill(date_str)
-        await element.evaluate("""el => {
+        await element.fill(formatted_val)
+        await element.evaluate("""(el, val) => {
+            // Also invoke Flatpickr / jQuery setDate if attached
+            if (el._flatpickr) {
+                try { el._flatpickr.setDate(val, true); } catch(e) {}
+            }
+            if (window.jQuery && window.jQuery(el).data('datepicker')) {
+                try { window.jQuery(el).datepicker('setDate', val); } catch(e) {}
+            }
             el.dispatchEvent(new Event('input', { bubbles: true }));
             el.dispatchEvent(new Event('change', { bubbles: true }));
             el.dispatchEvent(new Event('blur', { bubbles: true }));
-        }""")
+        }""", formatted_val)
         return True
 
     async def fallback_fill(self, ctx: Union[Page, Frame], element: ElementHandle, value: Any, **kwargs):
-        date_str = str(value).strip()
+        parsed_d = parse_date_value(value)
+        if not parsed_d:
+            return
+        inp_type = (await element.get_attribute("type") or "").lower()
+        ph = (await element.get_attribute("placeholder") or "").lower()
+        formatted_val = format_date_for_element(parsed_d, inp_type, ph)
+
         await element.evaluate("""(el, val) => {
-            el.value = val;
+            try {
+                let nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+                nativeSetter.call(el, val);
+            } catch(e) {
+                el.value = val;
+            }
+            if (el._flatpickr) {
+                try { el._flatpickr.setDate(val, true); } catch(e) {}
+            }
+            if (window.jQuery && window.jQuery(el).data('datepicker')) {
+                try { window.jQuery(el).datepicker('setDate', val); } catch(e) {}
+            }
             el.dispatchEvent(new Event('input', { bubbles: true }));
             el.dispatchEvent(new Event('change', { bubbles: true }));
-        }""", date_str)
+        }""", formatted_val)
 
     async def verify(self, ctx: Union[Page, Frame], element: ElementHandle, expected_value: Any, **kwargs) -> Tuple[bool, Optional[str]]:
-        """Re-reads the actual date value from the input."""
+        """Re-reads the actual date value from the input and compares parsed dates rather than just the year."""
         current_val = await element.input_value()
         curr_clean = (current_val or "").strip()
-        exp_clean = str(expected_value).strip()
-
         if not curr_clean:
-            return False, ""
+            curr_clean = (await element.get_attribute("value") or "").strip()
+            if not curr_clean:
+                return False, ""
 
-        if curr_clean == exp_clean or exp_clean in curr_clean or curr_clean in exp_clean:
-            return True, curr_clean
+        inp_type = (await element.get_attribute("type") or "").lower()
+        ph = (await element.get_attribute("placeholder") or "").lower()
 
-        # Check year match
-        y_curr = re.search(r'\d{4}', curr_clean)
-        y_exp = re.search(r'\d{4}', exp_clean)
-        if y_curr and y_exp and y_curr.group(0) == y_exp.group(0):
+        preferred_fmt = None
+        if "mm/dd" in ph:
+            preferred_fmt = "%m/%d/%Y"
+        elif "mm-dd" in ph:
+            preferred_fmt = "%m-%d-%Y"
+        elif "dd/mm" in ph:
+            preferred_fmt = "%d/%m/%Y"
+        elif "dd-mm" in ph:
+            preferred_fmt = "%d-%m-%Y"
+
+        exp_d = parse_date_value(expected_value, preferred_format=preferred_fmt)
+        curr_d = parse_date_value(curr_clean, preferred_format=preferred_fmt)
+
+        if not exp_d or not curr_d:
+            # If standard parsing fails, fallback to exact string check
+            if curr_clean.lower() == str(expected_value).strip().lower():
+                return True, curr_clean
+            return False, curr_clean
+
+        inp_type = (await element.get_attribute("type") or "").lower()
+        ph = (await element.get_attribute("placeholder") or "").lower()
+        is_month_year = (inp_type == "month") or bool(re.search(r'\b(mmm\s*yyyy|month\s*yyyy|mm/yyyy|yyyy-mm)\b', ph, re.I))
+
+        if is_month_year:
+            # For month-year inputs, compare year and month
+            if exp_d.year == curr_d.year and exp_d.month == curr_d.month:
+                return True, curr_clean
+            return False, curr_clean
+
+        # For full date inputs, compare complete date (year, month, and day)
+        if exp_d == curr_d:
             return True, curr_clean
 
         return False, curr_clean
@@ -651,7 +1025,20 @@ class WidgetExecutorRegistry:
         }
 
     def get_executor(self, widget_type: str) -> BaseWidgetExecutor:
-        return self.executors.get(widget_type, self.executors[WidgetType.TEXT])
+        w_type = (widget_type or "").lower().strip()
+        if w_type in ["select", "dropdown", "native_select"]:
+            return self.executors[WidgetType.NATIVE_SELECT]
+        if w_type in ["combobox", "custom_combobox", "typeahead", "react_select"]:
+            return self.executors[WidgetType.CUSTOM_COMBOBOX]
+        if w_type in ["radio", "radio_group"]:
+            return self.executors[WidgetType.RADIO]
+        if w_type in ["checkbox", "check"]:
+            return self.executors[WidgetType.CHECKBOX]
+        if w_type in ["date", "datepicker", "calendar"]:
+            return self.executors[WidgetType.DATE]
+        if w_type in ["file", "upload", "resume"]:
+            return self.executors[WidgetType.FILE]
+        return self.executors.get(w_type, self.executors[WidgetType.TEXT])
 
     async def detect_widget_type(self, ctx: Union[Page, Frame], element: ElementHandle) -> str:
         tag = await element.evaluate("e => e.tagName.toLowerCase()")
@@ -667,11 +1054,20 @@ class WidgetExecutorRegistry:
             return WidgetType.CHECKBOX
         if tag == "select":
             return WidgetType.NATIVE_SELECT
-        if role == "combobox" or "select__control" in el_class or "select2" in el_class or "combobox" in el_class:
+
+        is_combobox = await element.evaluate("""el => {
+            if (el.getAttribute('role') === 'combobox') return true;
+            if (el.getAttribute('aria-haspopup') === 'listbox') return true;
+            if (el.closest('.select__container, .select, [class*="select"], .select2-container, [role="combobox"]')) return true;
+            return false;
+        }""")
+        if is_combobox or role == "combobox" or "select__control" in el_class or "select2" in el_class or "combobox" in el_class:
             return WidgetType.CUSTOM_COMBOBOX
 
-        # Check date
-        if inp_type == "date" or "date" in el_class or "calendar" in el_class:
+        # Check date: type=date|month or known picker classes with word boundaries (never substring 'date')
+        if inp_type in ["date", "month"]:
+            return WidgetType.DATE
+        if KNOWN_DATE_PICKER_CLASSES.search(el_class):
             return WidgetType.DATE
 
         return WidgetType.TEXT

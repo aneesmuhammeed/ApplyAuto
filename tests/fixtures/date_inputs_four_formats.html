@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Date Inputs in Four Formats</title>
+</head>
+<body>
+  <form id="dates-form">
+    <!-- Format 1: Native Date (YYYY-MM-DD) -->
+    <div>
+      <label for="native_date">Available Start Date (Native)</label>
+      <input type="date" id="native_date" name="startDate" />
+    </div>
+
+    <br />
+
+    <!-- Format 2: Masked DD/MM/YYYY text -->
+    <div>
+      <label for="date_dmy">Date of Graduation (DD/MM/YYYY)</label>
+      <input type="text" id="date_dmy" name="gradDate" placeholder="DD/MM/YYYY" />
+    </div>
+
+    <br />
+
+    <!-- Format 3: Masked MM/DD/YYYY text -->
+    <div>
+      <label for="date_mdy">Certification Date (MM/DD/YYYY)</label>
+      <input type="text" id="date_mdy" name="certDate" placeholder="MM/DD/YYYY" />
+    </div>
+
+    <br />
+
+    <!-- Format 4: Native Month or Month-Year (YYYY-MM / MMM YYYY) -->
+    <div>
+      <label for="native_month">Previous Job End Month (Native Month)</label>
+      <input type="month" id="native_month" name="endMonth" />
+    </div>
+  </form>
+</body>
+</html>

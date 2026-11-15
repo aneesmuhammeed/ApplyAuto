@@ -40,12 +40,33 @@ def get_or_create_api_token(storage_path: Path) -> str:
 class Settings:
     def __init__(self):
         self.SQLITE_DB_PATH: str = str(db_file)
-        self.LLAMA_CPP_URL: str = os.getenv("LLAMA_CPP_URL", "http://127.0.0.1:1234/v1/chat/completions")
-        self.LLAMA_MODEL_NAME: str = os.getenv("LLAMA_MODEL_NAME", "tensorblock/Qwen_Qwen3-0.6B-GGUF:Q3_K_M")
         self.POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL", "2"))
         self.RESUME_STORAGE_DIR: str = str(storage_dir)
         self.DASHBOARD_ORIGIN: str = os.getenv("DASHBOARD_ORIGIN", "http://localhost:3000")
         self.API_TOKEN: str = get_or_create_api_token(storage_dir)
+
+    @property
+    def LLM_ENDPOINT(self) -> str:
+        return os.getenv("LOCAL_LLM_ENDPOINT") or os.getenv("LLAMA_CPP_URL") or "http://127.0.0.1:1234/v1/chat/completions"
+
+    @property
+    def LLAMA_CPP_URL(self) -> str:
+        return self.LLM_ENDPOINT
+
+    @property
+    def LLM_MODEL(self) -> str:
+        return os.getenv("LOCAL_LLM_MODEL") or os.getenv("LLAMA_MODEL_NAME") or "tensorblock/Qwen_Qwen3-0.6B-GGUF:Q3_K_M"
+
+    @property
+    def LLAMA_MODEL_NAME(self) -> str:
+        return self.LLM_MODEL
+
+    @property
+    def LLM_CONFIDENCE_THRESHOLD(self) -> float:
+        try:
+            return float(os.getenv("LLM_CONFIDENCE_THRESHOLD", "0.8"))
+        except (ValueError, TypeError):
+            return 0.8
 
     @property
     def HEADLESS_BROWSER(self) -> bool:

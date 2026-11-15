@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>React Select Portaled Async Options</title>
+  <style>
+    .react-select-container { width: 300px; margin-bottom: 20px; }
+    .react-select__control { border: 1px solid #ccc; padding: 6px; cursor: pointer; }
+    .react-select__menu { border: 1px solid #aaa; background: #fff; position: absolute; z-index: 9999; width: 300px; }
+    .react-select__option { padding: 8px; cursor: pointer; }
+    .react-select__option:hover { background: #f0f0f0; }
+  </style>
+</head>
+<body>
+  <form id="job-form">
+    <label for="university-input">Select University</label>
+    <div class="react-select-container" id="university-container">
+      <div class="react-select__control" id="university-control">
+        <div class="react-select__value-container">
+          <input
+            id="university-input"
+            class="react-select__input"
+            role="combobox"
+            aria-expanded="false"
+            aria-controls="react-select-portal-listbox"
+            aria-autocomplete="list"
+            autocomplete="off"
+            value=""
+          />
+        </div>
+      </div>
+    </div>
+  </form>
+
+  <!-- Portaled async container at body level -->
+  <div id="portal-root"></div>
+
+  <script>
+    const input = document.getElementById('university-input');
+    const control = document.getElementById('university-control');
+    const portal = document.getElementById('portal-root');
+
+    const optionsData = [
+      "Govt. Model Engineering College",
+      "Indian Institute of Technology",
+      "National Institute of Technology",
+      "Birla Institute of Technology and Science"
+    ];
+
+    function openPortalMenu() {
+      input.setAttribute('aria-expanded', 'true');
+      portal.innerHTML = `
+        <div class="react-select__menu" id="react-select-portal-listbox" role="listbox">
+          ${optionsData.map((opt, i) => `
+            <div role="option" class="react-select__option" id="opt-${i}" data-value="${opt}">${opt}</div>
+          `).join('')}
+        </div>
+      `;
+      // Position menu under control
+      const rect = control.getBoundingClientRect();
+      const menu = document.getElementById('react-select-portal-listbox');
+      menu.style.top = (rect.bottom + window.scrollY) + 'px';
+      menu.style.left = (rect.left + window.scrollX) + 'px';
+
+      document.querySelectorAll('.react-select__option').forEach(el => {
+        el.addEventListener('click', function() {
+          input.value = this.getAttribute('data-value');
+          input.setAttribute('aria-expanded', 'false');
+          portal.innerHTML = '';
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+      });
+    }
+
+    control.addEventListener('click', openPortalMenu);
+    input.addEventListener('focus', openPortalMenu);
+    input.addEventListener('click', openPortalMenu);
+  </script>
+</body>
+</html>
