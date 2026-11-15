@@ -448,8 +448,7 @@ class NativeSelectWidgetExecutor(BaseWidgetExecutor):
 
         # Extract available options
         options_data = await element.evaluate("""sel => {
-            if (!sel || !sel.options) return [];
-            return Array.from(sel.options).map((opt, idx) => ({
+            return Array.from((sel && sel.options) || []).map((opt, idx) => ({
                 index: idx,
                 value: opt.value || '',
                 text: (opt.text || '').trim()
@@ -491,8 +490,7 @@ class NativeSelectWidgetExecutor(BaseWidgetExecutor):
         if not target:
             return
         options_data = await element.evaluate("""sel => {
-            if (!sel || !sel.options) return [];
-            return Array.from(sel.options).map((opt, idx) => ({
+            return Array.from((sel && sel.options) || []).map((opt, idx) => ({
                 index: idx,
                 value: opt.value || '',
                 text: (opt.text || '').trim()
@@ -1171,10 +1169,32 @@ class WidgetExecutorRegistry:
         return self.executors.get(w_type, self.executors[WidgetType.TEXT])
 
     async def detect_widget_type(self, ctx: Union[Page, Frame], element: ElementHandle) -> str:
-        tag = await element.evaluate("e => e.tagName.toLowerCase()")
-        inp_type = (await element.get_attribute("type") or "").lower()
-        role = (await element.get_attribute("role") or "").lower()
-        el_class = (await element.get_attribute("class") or "").lower()
+        """
+        Detects the real widget type from the live DOM element.
+        tagName == 'select' gives NATIVE_SELECT.
+        input[type=file], radio, checkbox, date, month map to their respective types.
+        role=combobox, aria-haspopup=listbox, aria-controls, aria-owns, or an ancestor matching
+        [class*="select__"], .select2-container, [class*="MuiAutocomplete"] gives CUSTOM_COMBOBOX.
+        Otherwise TEXT.
+        """
+        tag = ""
+        try:
+            tag = await element.evaluate("e => e && e.tagName ? e.tagName.toLowerCase() : ''")
+        except Exception:
+            pass
+
+        if tag == "select":
+            return WidgetType.NATIVE_SELECT
+
+        inp_type = ""
+        role = ""
+        el_class = ""
+        try:
+            inp_type = (await element.get_attribute("type") or "").lower()
+            role = (await element.get_attribute("role") or "").lower()
+            el_class = (await element.get_attribute("class") or "").lower()
+        except Exception:
+            pass
 
         if inp_type == "file":
             return WidgetType.FILE
@@ -1182,23 +1202,31 @@ class WidgetExecutorRegistry:
             return WidgetType.RADIO
         if inp_type == "checkbox":
             return WidgetType.CHECKBOX
-        if tag == "select":
-            return WidgetType.NATIVE_SELECT
-
-        is_combobox = await element.evaluate("""el => {
-            if (el.getAttribute('role') === 'combobox') return true;
-            if (el.getAttribute('aria-haspopup') === 'listbox') return true;
-            if (el.closest('.select__container, .select, [class*="select"], .select2-container, [role="combobox"]')) return true;
-            return false;
-        }""")
-        if is_combobox or role == "combobox" or "select__control" in el_class or "select2" in el_class or "combobox" in el_class:
-            return WidgetType.CUSTOM_COMBOBOX
-
-        # Check date: type=date|month or known picker classes with word boundaries (never substring 'date')
         if inp_type in ["date", "month"]:
             return WidgetType.DATE
+
+        # Check datepicker classes
         if KNOWN_DATE_PICKER_CLASSES.search(el_class):
             return WidgetType.DATE
+
+        # Strict combobox detection: role=combobox, aria-haspopup=listbox, aria-controls, aria-owns,
+        # or ancestor matching [class*="select__"], .select2-container, [class*="MuiAutocomplete"]
+        is_combobox = False
+        try:
+            is_combobox = await element.evaluate("""el => {
+                if (!el) return false;
+                if (el.getAttribute('role') === 'combobox') return true;
+                if (el.getAttribute('aria-haspopup') === 'listbox') return true;
+                if (el.getAttribute('aria-controls')) return true;
+                if (el.getAttribute('aria-owns')) return true;
+                if (el.closest('[class*="select__"], .select2-container, [class*="MuiAutocomplete"]')) return true;
+                return false;
+            }""")
+        except Exception:
+            pass
+
+        if is_combobox or role == "combobox" or "select__" in el_class or "select2" in el_class:
+            return WidgetType.CUSTOM_COMBOBOX
 
         return WidgetType.TEXT
 
@@ -1213,34 +1241,31 @@ class WidgetExecutorRegistry:
         dom_type = await self.detect_widget_type(ctx, element)
         tag = ""
         try:
-            tag = await element.evaluate("e => e.tagName ? e.tagName.toLowerCase() : ''")
+            tag = await element.evaluate("e => e && e.tagName ? e.tagName.toLowerCase() : ''")
         except Exception:
             pass
 
+        # Real DOM element takes priority; declared question type is only a hint
         if not widget_type:
             target_type = dom_type
         else:
             w_norm = str(widget_type).lower().strip()
-            # If caller says native select, element MUST be an actual <select> tag in DOM
-            if w_norm in ["select", "native_select"]:
-                if tag == "select":
-                    target_type = WidgetType.NATIVE_SELECT
-                else:
-                    # Inaccurate question metadata: element is actually a combobox/input in DOM
-                    target_type = dom_type if dom_type != WidgetType.TEXT else WidgetType.CUSTOM_COMBOBOX
-            elif w_norm in ["combobox", "custom_combobox"] and tag == "select":
-                # Element in DOM is actually a native select
+            # If element is a native <select> tag in DOM, always use NATIVE_SELECT
+            if tag == "select":
                 target_type = WidgetType.NATIVE_SELECT
-            elif w_norm in ["text"] and dom_type in [WidgetType.CUSTOM_COMBOBOX, WidgetType.NATIVE_SELECT, WidgetType.RADIO, WidgetType.CHECKBOX, WidgetType.DATE]:
-                # Live DOM is a structured widget
+            # If element is not a <select> in DOM, cannot use NATIVE_SELECT
+            elif w_norm in ["select", "native_select"]:
+                target_type = dom_type if dom_type != WidgetType.TEXT else WidgetType.CUSTOM_COMBOBOX
+            # If DOM type is a structured widget (combobox, radio, checkbox, date), respect the DOM
+            elif dom_type in [WidgetType.CUSTOM_COMBOBOX, WidgetType.RADIO, WidgetType.CHECKBOX, WidgetType.DATE, WidgetType.FILE]:
                 target_type = dom_type
             else:
-                target_type = w_norm
+                target_type = w_norm or dom_type
 
         executor = self.get_executor(target_type)
         res = await executor.execute(ctx, element, value, **kwargs)
 
-        # Fallback: if native select failed on a non-select DOM element, retry with custom combobox
+        # Fallback: if fill or verification failed on a non-select DOM element with select executor, retry with custom combobox
         if (not res.success or not res.verification_passed) and target_type == WidgetType.NATIVE_SELECT and tag != "select":
             cb_executor = self.get_executor(WidgetType.CUSTOM_COMBOBOX)
             res = await cb_executor.execute(ctx, element, value, **kwargs)
@@ -1249,6 +1274,10 @@ class WidgetExecutorRegistry:
 
 # Global singleton
 widget_registry = WidgetExecutorRegistry()
+
+async def detect_widget_type(ctx: Union[Page, Frame], element: ElementHandle) -> str:
+    """Convenience standalone function to detect widget type from the live DOM element."""
+    return await widget_registry.detect_widget_type(ctx, element)
 
 # =========================================================================
 # COMPREHENSIVE POST-FILL VERIFICATION STEP

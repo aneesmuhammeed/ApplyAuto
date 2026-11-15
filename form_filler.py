@@ -727,21 +727,9 @@ async def fast_restore_form_data(
             if not el:
                 continue
 
-            # Map to WidgetType
-            if f_type == "file" or f_tag == "file":
-                w_type = WidgetType.FILE
-            elif f_type in ["select", "native_select"] or f_tag == "select":
-                w_type = WidgetType.NATIVE_SELECT
-            elif f_type in ["combobox", "custom_combobox"] or f_tag == "combobox":
-                w_type = WidgetType.CUSTOM_COMBOBOX
-            elif f_type == "radio":
-                w_type = WidgetType.RADIO
-            elif f_type == "checkbox":
-                w_type = WidgetType.CHECKBOX
-            elif f_type == "date":
-                w_type = WidgetType.DATE
-            else:
-                w_type = WidgetType.TEXT
+            # Detect real widget type from DOM element (declared question type is only a hint)
+            detected_type = await widget_registry.detect_widget_type(ctx, el)
+            w_type = detected_type or WidgetType.TEXT
 
             target_val = val
             if w_type == WidgetType.FILE:
@@ -984,14 +972,15 @@ async def fill_form_on_page(
                 role == "combobox"
                 or (await el.get_attribute("aria-haspopup") == "listbox")
                 or bool(await el.get_attribute("aria-controls"))
-                or bool(await el.evaluate("e => !!e.closest('[role=\"combobox\"], div[class*=\"select\"], div[class*=\"MuiAutocomplete\"]')"))
+                or bool(await el.get_attribute("aria-owns"))
+                or bool(await el.evaluate("""e => !!e.closest('[role="combobox"], [class*="select__"], .select2-container, [class*="MuiAutocomplete"]')"""))
             )
             if is_combobox:
                 cb_txt = (await el.inner_text() or "").strip()
                 if cb_txt in ["+91", "INR", "USD"] or (cb_txt == "Select" and any(w in label.lower() for w in ["phone", "code", "dial"])):
                     continue
 
-                parent_handle = await el.evaluate_handle("e => e.closest('[role=\"combobox\"], div[class*=\"select\"], div[class*=\"MuiAutocomplete\"]')")
+                parent_handle = await el.evaluate_handle("""e => e.closest('[role="combobox"], [class*="select__"], .select2-container, [class*="MuiAutocomplete"]')""")
                 parent_container = parent_handle.as_element() if parent_handle else None
                 if parent_container:
                     val_container = await parent_container.query_selector("[class*='singleValue'], [class*='single-value'], .select2-selection__rendered")
@@ -1215,8 +1204,7 @@ async def fill_form_on_page(
                 select_options = []
                 try:
                     select_options = await el.evaluate("""sel => {
-                        if (!sel || !sel.options) return [];
-                        return Array.from(sel.options).map(o => o.text.trim()).filter(Boolean);
+                        return Array.from((sel && sel.options) || []).map(o => o.text.trim()).filter(Boolean);
                     }""")
                 except Exception:
                     select_options = []
@@ -1399,8 +1387,8 @@ async def fill_form_on_page(
             # 7. TEXT, EMAIL, PHONE, AND TEXTAREA INPUTS
             # =========================================================================
             if tag in ["input", "textarea"]:
-                # Skip elements inside custom select controls
-                if await el.query_selector('xpath=ancestor::div[contains(@class, "select")]'):
+                # Skip elements inside custom combobox/select controls
+                if await el.query_selector('xpath=ancestor::*[contains(@class, "select__") or contains(@class, "select2") or contains(@class, "MuiAutocomplete")]'):
                     continue
 
                 curr_val = await el.input_value()
