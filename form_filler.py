@@ -580,7 +580,7 @@ async def verify_form_completion_and_errors(ctx) -> Dict[str, Any]:
                     empty_required.append(f"{field_name} (Checkbox unchecked)")
 
             elif tag == "select":
-                val = await el.evaluate("s => s.options[s.selectedIndex] ? s.options[s.selectedIndex].text.trim() : ''")
+                val = await el.evaluate("s => (s && s.options && s.selectedIndex >= 0 && s.options[s.selectedIndex]) ? s.options[s.selectedIndex].text.trim() : ''")
                 if not val or val.lower() in ["select", "select an option", "select...", "-- select --", "choose"]:
                     empty_required.append(f"{field_name} (Dropdown unselected)")
 
@@ -751,8 +751,8 @@ async def fast_restore_form_data(
             if target_val is None:
                 continue
 
-            # Restore and re-verify via dedicated widget executor
-            exec_res = await widget_registry.get_executor(w_type).execute(ctx, el, target_val)
+            # Restore and re-verify via dedicated widget executor with live DOM reconciliation
+            exec_res = await widget_registry.execute_element(ctx, el, target_val, widget_type=f_type)
 
             if exec_res.success and exec_res.verification_passed:
                 restored_count += 1

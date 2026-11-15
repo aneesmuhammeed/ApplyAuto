@@ -1217,14 +1217,35 @@ async def verify_filled_widgets(
             })
             continue
 
-        executor = widget_registry.get_executor(norm_type)
+        # Reconcile declared widget type with live DOM tag
+        dom_type = await widget_registry.detect_widget_type(ctx, el)
+        tag = ""
+        try:
+            tag = await el.evaluate("e => e.tagName ? e.tagName.toLowerCase() : ''")
+        except Exception:
+            pass
+
+        resolved_type = norm_type
+        if norm_type in [WidgetType.NATIVE_SELECT] and tag != "select":
+            resolved_type = dom_type if dom_type != WidgetType.TEXT else WidgetType.CUSTOM_COMBOBOX
+        elif norm_type == WidgetType.TEXT and dom_type in [WidgetType.CUSTOM_COMBOBOX, WidgetType.NATIVE_SELECT, WidgetType.RADIO, WidgetType.CHECKBOX, WidgetType.DATE]:
+            resolved_type = dom_type
+
+        executor = widget_registry.get_executor(resolved_type)
         is_ok, read_val = await executor.verify(ctx, el, expected_val)
+
+        # Fallback retry if native_select was attempted on non-select element
+        if not is_ok and resolved_type == WidgetType.NATIVE_SELECT and tag != "select":
+            cb_exec = widget_registry.get_executor(WidgetType.CUSTOM_COMBOBOX)
+            is_ok, read_val = await cb_exec.verify(ctx, el, expected_val)
+            if is_ok:
+                resolved_type = WidgetType.CUSTOM_COMBOBOX
 
         if is_ok:
             report["verified_count"] += 1
             report["results"].append({
                 "field": field_label,
-                "widget_type": norm_type,
+                "widget_type": resolved_type,
                 "passed": True,
                 "expected": expected_val,
                 "read_value": read_val
@@ -1234,7 +1255,7 @@ async def verify_filled_widgets(
             report["all_passed"] = False
             report["results"].append({
                 "field": field_label,
-                "widget_type": norm_type,
+                "widget_type": resolved_type,
                 "passed": False,
                 "expected": expected_val,
                 "read_value": read_val,
