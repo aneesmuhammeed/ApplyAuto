@@ -347,5 +347,27 @@ class TestFixturesWidgets(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(m_no[0], 2, "Option 'No, none of the above' should match 'no'")
         self.assertEqual(m_no[1], "No, none of the above")
 
+        # 9. form_filler fast_restore exact label and map_intent tests
+        from form_filler import map_intent_to_profile, fast_restore_form_data
+        oneword = {"full_name": "Cher", "first_name": "Cher"}
+        ln = await map_intent_to_profile("last_name", oneword)
+        self.assertEqual(ln, "", "One-word names must yield empty last name string")
+
+        # 10. Verify fast_restore_form_data returns RestoreResult dataclass
+        dummy_form_data = {
+            "fields": {
+                "field_1": {
+                    "label": "Availability Date",
+                    "value": "2025-06-15",
+                    "type": "date",
+                    "selector": "#date-no-placeholder"
+                }
+            }
+        }
+        restore_res = await fast_restore_form_data(page, dummy_form_data)
+        self.assertEqual(restore_res.restored_count, 1)
+        self.assertTrue(restore_res.all_passed)
+        self.assertEqual(len(restore_res.verified_fields), 1)
+
 if __name__ == "__main__":
     unittest.main()

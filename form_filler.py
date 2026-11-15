@@ -14,15 +14,28 @@ from widget_executors import (
 )
 from database import generate_question_key
 
+_last_checkpoint_check_time: float = 0.0
+_cached_checkpoint_result: Optional[str] = None
+
 async def detect_security_checkpoint(page: Page) -> Optional[str]:
     """
     Check if an active, blocking CAPTCHA challenge or bot verification is blocking the page:
     1. Interactive Cloudflare Turnstile / challenge-running
     2. Active reCAPTCHA / hCaptcha challenge frames
     3. Arkose Labs / Datadome / PerimeterX modals
-    4. Text headings ("Verify you are human", "Security Check")
+    4. Text headings ("Verify you are human", "Security Check") inside visible blocking overlays or iframes.
+    Rate-limited to prevent excessive DOM scanning on every poll.
     Returns a description of the barrier if found, or None.
     """
+    global _last_checkpoint_check_time, _cached_checkpoint_result
+    now = time.time()
+    # Rate limit check to once every 2.0 seconds unless previous check found a barrier
+    if now - _last_checkpoint_check_time < 2.0 and _cached_checkpoint_result is None:
+        return None
+
+    _last_checkpoint_check_time = now
+    _cached_checkpoint_result = None
+
     try:
         # 1. Cloudflare Turnstile & Challenge platform
         cf_blocks = await page.query_selector_all(
@@ -30,7 +43,8 @@ async def detect_security_checkpoint(page: Page) -> Optional[str]:
         )
         for cf in cf_blocks:
             if await cf.is_visible():
-                return "Cloudflare Bot Verification detected. Please solve the challenge on your laptop window, then click Resume."
+                _cached_checkpoint_result = "Cloudflare Bot Verification detected. Please solve the challenge on your laptop window, then click Resume."
+                return _cached_checkpoint_result
 
         # 2. Active reCAPTCHA / hCaptcha challenge frames
         captcha_frames = await page.query_selector_all(
@@ -40,7 +54,8 @@ async def detect_security_checkpoint(page: Page) -> Optional[str]:
             if await frame.is_visible():
                 box = await frame.bounding_box()
                 if box and box["width"] > 200 and box["height"] > 200:
-                    return "Security CAPTCHA challenge detected. Please complete on your laptop window, then click Resume."
+                    _cached_checkpoint_result = "Security CAPTCHA challenge detected. Please complete on your laptop window, then click Resume."
+                    return _cached_checkpoint_result
 
         # 3. Arkose Labs / Datadome / PerimeterX
         bot_frames = await page.query_selector_all(
@@ -48,17 +63,19 @@ async def detect_security_checkpoint(page: Page) -> Optional[str]:
         )
         for frame in bot_frames:
             if await frame.is_visible():
-                return "Anti-Bot Verification challenge detected. Please solve on your laptop window, then click Resume."
+                _cached_checkpoint_result = "Anti-Bot Verification challenge detected. Please solve on your laptop window, then click Resume."
+                return _cached_checkpoint_result
 
-        # 4. Visible heading text blocks
-        visible_blocks = await page.query_selector_all(
-            'h1, h2, h3, .challenge-container, [id*="captcha"]'
+        # 4. Visible heading text blocks: require a visible blocking modal, overlay, challenge-container, or iframe
+        blocking_containers = await page.query_selector_all(
+            '.challenge-container, [id*="captcha"], [class*="captcha"], .modal-backdrop, [role="dialog"], .security-checkpoint'
         )
-        for el in visible_blocks:
-            if await el.is_visible():
-                txt = (await el.inner_text() or "").lower()
+        for container in blocking_containers:
+            if await container.is_visible():
+                txt = (await container.inner_text() or "").lower()
                 if any(w in txt for w in ["verify you are human", "enter the verification code", "one-time password", "security check", "suspicious activity"]):
-                    return "Security verification detected. Please complete on your laptop window, then click Resume."
+                    _cached_checkpoint_result = "Security verification detected. Please complete on your laptop window, then click Resume."
+                    return _cached_checkpoint_result
     except Exception:
         pass
 
@@ -287,7 +304,7 @@ async def get_group_question(ctx, el: ElementHandle) -> str:
         if aria_labelledby:
             parts = []
             for lid in aria_labelledby.split():
-                lbl_target = await ctx.query_selector(f'#{lid}')
+                lbl_target = await ctx.query_selector(f'[id="{lid}"]')
                 if lbl_target:
                     txt = (await lbl_target.inner_text() or "").strip()
                     if txt and not any(skip in txt.lower() for skip in ["error", "required"]):
@@ -465,6 +482,11 @@ async def map_intent_to_profile(intent: str, profile: Dict[str, Any]) -> Optiona
     first_name = profile.get("first_name") or (parts[0] if parts else "")
     last_name = profile.get("last_name") or (" ".join(parts[1:]) if len(parts) > 1 else "")
     city = profile.get("city") or profile.get("location", "")
+    country = profile.get("country") or ""
+    if not country and profile.get("location"):
+        loc_p = [p.strip() for p in profile["location"].split(",") if p.strip()]
+        if loc_p:
+            country = loc_p[-1]
 
     mapping = {
         "full_name": full_name,
@@ -474,6 +496,7 @@ async def map_intent_to_profile(intent: str, profile: Dict[str, Any]) -> Optiona
         "phone": profile.get("phone", ""),
         "location": profile.get("location", "") or city,
         "city": city,
+        "country": country,
         "linkedin": profile.get("linkedin_url", ""),
         "github": profile.get("github_url", ""),
         "portfolio": profile.get("portfolio_url", "") or profile.get("linkedin_url", "")
@@ -549,20 +572,18 @@ async def verify_form_completion_and_errors(ctx) -> Dict[str, Any]:
             if not await el.is_visible() and inp_type != "file" and tag != "select":
                 continue
 
-            # Determine if element is required
+            # Determine if element itself is required
             is_req = False
             if await el.get_attribute("required") is not None or await el.get_attribute("aria-required") == "true":
                 is_req = True
-            
-            label = await get_element_label(ctx, el)
-            if "*" in label or "required" in (await el.get_attribute("class") or "").lower():
+
+            el_class = (await el.get_attribute("class") or "").lower()
+            if "required" in el_class.split() or "is-required" in el_class.split():
                 is_req = True
 
-            parent = await el.query_selector("xpath=ancestor::div[contains(@class, 'field') or contains(@class, 'form-group') or contains(@class, 'question')][1]")
-            if parent:
-                parent_html = (await parent.inner_html() or "").lower()
-                if 'class="asterisk"' in parent_html or 'class="required"' in parent_html or "aria-required" in parent_html:
-                    is_req = True
+            label = await get_element_label(ctx, el)
+            if "*" in label:
+                is_req = True
 
             if not is_req:
                 continue
@@ -669,19 +690,30 @@ async def fast_restore_form_data(
                 except Exception:
                     el = None
 
-            # Find by label without :has-text
+            # Find by label: exact normalized match first, then require a unique match
             if not el and f_label:
                 try:
                     f_lbl_clean = f_label.strip().lower()
                     all_labels = await ctx.query_selector_all('label')
+                    exact_matches = []
+                    partial_matches = []
                     for l_el in all_labels:
                         l_txt = (await l_el.inner_text() or "").strip().lower()
-                        if l_txt == f_lbl_clean or f_lbl_clean in l_txt:
-                            for_attr = await l_el.get_attribute("for")
-                            if for_attr:
-                                el = await ctx.query_selector(f'[id="{for_attr}"]')
-                                if el:
-                                    break
+                        for_attr = await l_el.get_attribute("for")
+                        if not for_attr:
+                            continue
+                        target_el = await ctx.query_selector(f'[id="{for_attr}"]')
+                        if not target_el:
+                            continue
+                        if l_txt == f_lbl_clean:
+                            exact_matches.append(target_el)
+                        elif f_lbl_clean and f_lbl_clean in l_txt:
+                            partial_matches.append(target_el)
+
+                    if len(exact_matches) == 1:
+                        el = exact_matches[0]
+                    elif not exact_matches and len(partial_matches) == 1:
+                        el = partial_matches[0]
                 except Exception:
                     el = None
 
@@ -691,11 +723,13 @@ async def fast_restore_form_data(
                     if interactive_elements is None:
                         interactive_elements = await ctx.query_selector_all('input, select, textarea, [role="combobox"]')
                     f_lbl_clean = f_label.strip().lower()
+                    exact_cands = []
                     for cand in interactive_elements:
                         cand_lbl = (await get_element_label(ctx, cand)).strip().lower()
-                        if cand_lbl and (cand_lbl == f_lbl_clean or f_lbl_clean in cand_lbl or cand_lbl in f_lbl_clean):
-                            el = cand
-                            break
+                        if cand_lbl and cand_lbl == f_lbl_clean:
+                            exact_cands.append(cand)
+                    if len(exact_cands) == 1:
+                        el = exact_cands[0]
                 except Exception:
                     el = None
 
@@ -775,8 +809,15 @@ async def fill_form_on_page(
     if "fields" not in form_data or not isinstance(form_data["fields"], dict):
         form_data["fields"] = {}
 
-    def record_filled(k_id, k_name, k_label, k_tag, k_type, k_val, selector=""):
-        key = f"id:{k_id}" if k_id else (f"name:{k_name}" if k_name else f"label:{k_label.lower().strip()}")
+    def record_filled(k_id, k_name, k_label, k_tag, k_type, k_val, selector="", idx: int = 0):
+        if k_id:
+            key = f"id:{k_id}"
+        elif k_name:
+            key = f"name:{k_name}"
+        elif selector:
+            key = f"sel:{selector}"
+        else:
+            key = f"label:{k_label.lower().strip()}:{idx}"
         form_data["fields"][key] = {
             "key": key,
             "id": k_id,
@@ -841,12 +882,18 @@ async def fill_form_on_page(
         # Generate stable, canonical slugified question key
         stable_key = generate_question_key(clean_lbl, field_type=field_type, company_name=job_context)
 
-        # Scope classification: location, relocation, notice period, nda are company-specific
-        company_specific_keywords = [
-            "relocat", "office", "bangalore", "bengaluru", "location", "commute",
-            "notice period", "nda", "non-disclosure", "policy", "agreement"
+        # Scope classification using strict word-boundary matching
+        # Avoid false positives: "agenda" matching "nda", "officer" matching "office", or generic "Location (City)" matching company location
+        company_specific_patterns = [
+            r'\b(relocat(e|ion|ing)?)\b',
+            r'\b(in-office|on-site|office\s*location|which\s*office)\b',
+            r'\b(bangalore|bengaluru|mumbai|hyderabad|delhi|gurgaon|pune|chennai)\b',
+            r'\b(commute|commuting)\b',
+            r'\b(notice\s*period)\b',
+            r'\b(nda|non-disclosure\s*agreement)\b',
+            r'\b(company\s*policy|terms\s*of\s*service)\b'
         ]
-        is_company_scope = any(k in lbl_key for k in company_specific_keywords)
+        is_company_scope = any(re.search(pat, lbl_key) for pat in company_specific_patterns)
         scope = "this company" if is_company_scope else "global"
 
         q_dict = {
@@ -894,10 +941,13 @@ async def fill_form_on_page(
 
             # Radio group deduplication: handle the group on the first radio encountered
             if inp_type == "radio":
-                if name and name in processed_radio_groups:
+                group_key = name
+                if not group_key:
+                    group_container = await el.evaluate_handle("""e => e.closest('fieldset, [role="radiogroup"], .radio-group, .form-group, .radio-group-container') || e.parentElement""")
+                    group_key = str(await group_container.evaluate("""c => c.id || c.getAttribute('aria-labelledby') || c.innerText.slice(0, 40)""")) if group_container else str(el_idx)
+                if group_key in processed_radio_groups:
                     continue
-                if name:
-                    processed_radio_groups.add(name)
+                processed_radio_groups.add(group_key)
 
             # Resolve human-readable label
             label = await get_element_label(ctx, el)
@@ -959,11 +1009,13 @@ async def fill_form_on_page(
             # 2. CUSTOM COMBOBOXES & REACT/GREENHOUSE TYPEAHEADS
             # =========================================================================
             is_combobox = (
-                role == "combobox"
-                or (await el.get_attribute("aria-haspopup") == "listbox")
-                or bool(await el.get_attribute("aria-controls"))
-                or bool(await el.get_attribute("aria-owns"))
-                or bool(await el.evaluate("""e => !!e.closest('[role="combobox"], [class*="select__"], .select2-container, [class*="MuiAutocomplete"]')"""))
+                tag != "select" and (
+                    role == "combobox"
+                    or (await el.get_attribute("aria-haspopup") == "listbox")
+                    or bool(await el.get_attribute("aria-controls"))
+                    or bool(await el.get_attribute("aria-owns"))
+                    or bool(await el.evaluate("""e => !!e.closest('[role="combobox"], [class*="select__"], .select2-container, [class*="MuiAutocomplete"]')"""))
+                )
             )
             if is_combobox:
                 cb_txt = (await el.inner_text() or "").strip()
@@ -983,7 +1035,19 @@ async def fill_form_on_page(
                 if is_country_field:
                     loc_val = profile.get("location") or ""
                     loc_parts = [p.strip() for p in loc_val.split(",") if p.strip()]
-                    country_val = profile.get("country") or (loc_parts[-1] if loc_parts else "India")
+                    country_val = profile.get("country") or (loc_parts[-1] if loc_parts else None)
+                    if not country_val:
+                        # Cannot derive country from profile; ask the user
+                        collect_unanswered_question(
+                            field_id=el_id or name or label,
+                            label=label,
+                            field_type="combobox",
+                            options=[],
+                            ai_suggestion="",
+                            category="general"
+                        )
+                        continue
+
                     cb_exec = widget_registry.get_executor(WidgetType.CUSTOM_COMBOBOX)
                     exec_res = await cb_exec.execute(ctx, el, country_val)
                     if exec_res.success:

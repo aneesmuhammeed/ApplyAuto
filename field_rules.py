@@ -11,7 +11,8 @@ def get_field_match_by_rules(label: str, profile: Dict[str, Any]) -> Optional[st
     if not label or not label.strip() or not profile:
         return None
 
-    lbl = label.lower().strip()
+    # Strip asterisks, colons, and extra trailing whitespace from label
+    lbl = re.sub(r'[\*:]', '', label).lower().strip()
 
     # =========================================================================
     # 1. SPECIFIC PHONE COUNTRY / DIAL CODE (Runs BEFORE Generic Phone)

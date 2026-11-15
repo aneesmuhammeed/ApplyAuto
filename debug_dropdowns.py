@@ -18,7 +18,7 @@ async def inspect():
         print("After click, aria-controls:", aria_controls)
         
         if aria_controls:
-            listbox = await page.query_selector(f"#{aria_controls}")
+            listbox = await page.query_selector(f'[id="{aria_controls}"]')
             print("listbox element found?", bool(listbox))
             if listbox:
                 opt_els = await listbox.query_selector_all('[role="option"], .select__option')
