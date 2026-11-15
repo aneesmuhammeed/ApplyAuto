@@ -1,6 +1,7 @@
 import httpx
 import json
 import re
+import hashlib
 from typing import Optional, Dict, Any, List
 from config import settings
 
@@ -60,18 +61,20 @@ def make_cache_key(
     label: str,
     cache_type: str = "choice",
     options: Optional[List[str]] = None,
-    tag_type: str = ""
+    tag_type: str = "",
+    application_id: str = ""
 ) -> str:
-    """Generate consistent cache key for L1/L2 cache."""
+    """Generate consistent cache key for L1/L2 cache, optionally scoped to application_id."""
     norm_lbl = normalize_label_for_cache(sanitize_form_label(label))
+    app_prefix = f"app:{application_id}:" if application_id else ""
     if cache_type == "choice":
-        norm_opts = ",".join(sorted([normalize_label_for_cache(o) for o in (options or [])]))
-        return f"choice:{norm_lbl}:{norm_opts}"
+        norm_opts = hashlib.sha256(",".join(sorted([normalize_label_for_cache(o) for o in (options or [])])).encode("utf-8")).hexdigest()[:16]
+        return f"{app_prefix}choice:{norm_lbl}:{norm_opts}"
     elif cache_type == "interpret":
-        return f"interpret:{norm_lbl}:{tag_type}"
+        return f"{app_prefix}interpret:{norm_lbl}:{tag_type}"
     elif cache_type == "freetext":
-        return f"freetext:{norm_lbl}"
-    return f"{cache_type}:{norm_lbl}"
+        return f"{app_prefix}freetext:{norm_lbl}"
+    return f"{app_prefix}{cache_type}:{norm_lbl}"
 
 def get_cached_llm_result(cache_key: str) -> Optional[Any]:
     """Retrieve result from L1 memory cache or L2 database cache."""
@@ -343,7 +346,8 @@ async def ai_generate_tailored_answer(
     question_text: str,
     candidate_profile: Dict[str, Any],
     job_context: str = "",
-    options: Optional[List[str]] = None
+    options: Optional[List[str]] = None,
+    application_id: str = ""
 ) -> Optional[str]:
     """
     Evaluate form questions using local LLM:
@@ -353,7 +357,7 @@ async def ai_generate_tailored_answer(
     2. For free-text: synthesizes 1-2 sentence suggestions strictly from candidate facts.
        NOTE: Caller must NEVER auto-fill free text into the page; show as suggestion in question batch.
     3. Untrusted input defense: sanitizes and truncates question_text and job_context.
-    4. Caches results per normalized label and options.
+    4. Caches results per normalized label and options (optionally scoped to application_id).
     """
     clean_q = sanitize_form_label(question_text, max_length=150)
     clean_job = sanitize_form_label(job_context, max_length=80)
@@ -361,12 +365,12 @@ async def ai_generate_tailored_answer(
 
     # Check cache
     if options:
-        cache_key = make_cache_key(clean_q, cache_type="choice", options=options)
+        cache_key = make_cache_key(clean_q, cache_type="choice", options=options, application_id=application_id)
         cached = get_cached_llm_result(cache_key)
         if cached is not None:
             return None if cached == "__ASK_USER__" else str(cached)
     else:
-        cache_key = make_cache_key(clean_q, cache_type="freetext")
+        cache_key = make_cache_key(clean_q, cache_type="freetext", application_id=application_id)
         cached = get_cached_llm_result(cache_key)
         if cached is not None:
             return str(cached)

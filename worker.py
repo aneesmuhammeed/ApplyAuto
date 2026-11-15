@@ -9,7 +9,8 @@ from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from config import settings
 from database import (
     get_profile, get_saved_answers, get_applications, get_application,
-    update_application, update_worker_heartbeat, create_saved_answer
+    update_application, update_worker_heartbeat, create_saved_answer,
+    acquire_queued_application, recover_stuck_processing_applications
 )
 from form_filler import (
     fill_form_on_page, detect_security_checkpoint, detect_login_wall,
@@ -181,7 +182,24 @@ class ApplyMateWorker:
         # Each application gets its own dedicated page in the persistent context
         page = await self.get_or_create_page(app_id)
 
-        # Check if page is currently positioned on the target job application page
+        # Check if total application execution time exceeded global timeout (15 minutes)
+        created_at_str = app.get("created_at") or ""
+        if created_at_str:
+            try:
+                created_ts = time.mktime(time.strptime(created_at_str, '%Y-%m-%d %H:%M:%S'))
+                if (time.time() - created_ts) > 900:  # 15 minutes timeout
+                    timeout_msg = f"Application exceeded maximum duration timeout of 15 minutes."
+                    await self.log_app(app_id, f"[Timeout] {timeout_msg}")
+                    screenshot = await self.capture_screenshot(page)
+                    update_application(app_id, {
+                        "status": "failed",
+                        "error_message": timeout_msg,
+                        "review_screenshot_url": screenshot
+                    })
+                    await self.close_page(app_id)
+                    return
+            except Exception:
+                pass
         current_url = page.url if page else ""
         is_page_open = (
             current_url 
@@ -229,17 +247,75 @@ class ApplyMateWorker:
                         await self.log_app(app_id, f"[Crash Recovery Warning] Re-verification failed for restored field(s): {failed_names}")
             except Exception as e:
                 await self.log_app(app_id, f"Failed to load job page: {e}")
+                screenshot = await self.capture_screenshot(page)
                 update_application(app_id, {
                     "status": "failed",
-                    "error_message": f"Navigation failed: {e}"
+                    "error_message": f"Navigation failed: {e}",
+                    "review_screenshot_url": screenshot
                 })
                 await self.close_page(app_id)
                 return
 
         # Check if resuming from paused (e.g. user manually solved CAPTCHA or clicked resume)
         if status == "paused":
-            await self.log_app(app_id, "Resuming application after manual verification...")
-            update_application(app_id, {"status": "processing"})
+            await self.log_app(app_id, "Resuming application after manual verification in browser...")
+            # Re-read DOM values for fields marked manual_required
+            ctx = await get_form_context(page)
+            unanswered_q_list = app.get("unanswered_questions") or []
+            if app.get("unanswered_question") and not unanswered_q_list:
+                unanswered_q_list = [app.get("unanswered_question")]
+            
+            still_pending = []
+            for q_item in unanswered_q_list:
+                q_field_id = (q_item.get("field_id") or "").strip()
+                q_label = (q_item.get("label") or "").strip()
+                target_el = None
+                if q_field_id:
+                    try:
+                        target_el = await ctx.query_selector(f'[id="{q_field_id}"]') or await ctx.query_selector(f'[name="{q_field_id}"]')
+                    except Exception:
+                        target_el = None
+                if not target_el and q_label:
+                    try:
+                        clean_lbl = q_label.strip().lower()
+                        for cand in await ctx.query_selector_all('input, select, textarea, [role="combobox"]'):
+                            cand_lbl = (await get_element_label(ctx, cand)).strip().lower()
+                            if cand_lbl and (cand_lbl == clean_lbl or clean_lbl in cand_lbl):
+                                target_el = cand
+                                break
+                    except Exception:
+                        pass
+                
+                # If target element now has a non-empty value entered by the user in the browser, consider it satisfied
+                if target_el:
+                    dom_type = await widget_registry.detect_widget_type(ctx, target_el)
+                    ok, read_val = await widget_registry.get_executor(dom_type).verify(ctx, target_el, q_item.get("answer") or "")
+                    if not ok and read_val:
+                        # Value was entered manually by the user
+                        ok = True
+                    if ok and read_val:
+                        await self.log_app(app_id, f"[Resume] Verified manual entry in browser for '{q_label}': '{read_val}'")
+                        ans_key = f"id:{q_field_id}" if q_field_id else f"label:{q_label.lower().strip()}"
+                        persisted_form_data.setdefault("fields", {})[ans_key] = {
+                            "key": ans_key,
+                            "id": q_field_id,
+                            "name": q_field_id,
+                            "label": q_label,
+                            "tag": "input",
+                            "type": dom_type,
+                            "value": str(read_val),
+                            "verified": read_val,
+                            "timestamp": time.time()
+                        }
+                        continue
+                still_pending.append(q_item)
+            
+            update_application(app_id, {
+                "status": "processing",
+                "unanswered_questions": still_pending,
+                "unanswered_question": still_pending[0] if still_pending else None,
+                "form_data": persisted_form_data
+            })
 
         # Check if batch answers or single user answer arrived (CLI, Telegram, Dashboard)
         batch_answers = app.get("batch_answers") or []
@@ -281,6 +357,11 @@ class ApplyMateWorker:
                 # Unique key for tracking attempts per question per application
                 q_key = (ans_field_id or ans_lbl).strip().lower()
                 app_attempts_map = self.app_attempts.setdefault(app_id, {})
+                
+                # Check persisted attempts in form_data if memory map doesn't have it (survives worker restarts)
+                persisted_attempts = persisted_form_data.setdefault("question_attempts", {})
+                if q_key not in app_attempts_map and q_key in persisted_attempts:
+                    app_attempts_map[q_key] = persisted_attempts[q_key]
                 current_attempt = app_attempts_map.get(q_key, 0)
 
                 # Exponential backoff delay if this question was previously attempted
@@ -355,8 +436,9 @@ class ApplyMateWorker:
 
                 if exec_res.success and exec_res.verification_passed:
                     applied_count += 1
-                    # Reset attempt counter on success
+                    # Reset attempt counter on success in memory and persisted snapshot
                     app_attempts_map[q_key] = 0
+                    persisted_attempts[q_key] = 0
                     # Store the verified option text rather than unverified user input
                     verified_text = str(exec_res.verified_value if exec_res.verified_value is not None else ans_val)
                     await self.log_app(app_id, f"Verified answer for '{ans_lbl}': '{verified_text}'")
@@ -398,6 +480,7 @@ class ApplyMateWorker:
                     err_msg = exec_res.error or "Verification check failed after fill"
                     current_attempt += 1
                     app_attempts_map[q_key] = current_attempt
+                    persisted_attempts[q_key] = current_attempt
                     ans_item["attempts"] = current_attempt
                     ans_item["last_error"] = err_msg
                     ans_item["verification_failed"] = True
@@ -491,7 +574,8 @@ class ApplyMateWorker:
         fill_res = await fill_form_on_page(
             page, profile, saved_answers, resume_path,
             job_context=company_name,
-            existing_form_data=persisted_form_data
+            existing_form_data=persisted_form_data,
+            application_id=app_id
         )
 
         if "form_data" in fill_res:
@@ -530,7 +614,7 @@ class ApplyMateWorker:
             try:
                 batch_keys = []
                 for q in q_batch:
-                    k = q.get("key") or q.get("field_id") or q.get("label", "")
+                    k = q.get("question_key") or q.get("key") or q.get("field_id") or q.get("label", "")
                     batch_keys.append(str(k).strip().lower())
                 batch_hash = hashlib.sha256("|".join(sorted(batch_keys)).encode("utf-8")).hexdigest()
 
@@ -813,15 +897,17 @@ class ApplyMateWorker:
                 "pre_submit_screenshot": pre_screenshot_path,
                 "post_submit_screenshot": post_screenshot_path
             })
-            # Close the application's page on completion
-            await self.close_page(app_id)
-
         except Exception as e:
             await self.log_app(app_id, f"Error clicking submit button: {e}")
+            screenshot = await self.capture_screenshot(page)
             update_application(app_id, {
                 "status": "failed",
-                "error_message": f"Submit error: {e}"
+                "error_message": f"Submit error: {e}",
+                "review_screenshot_url": screenshot
             })
+        finally:
+            # Ensure the application's page is closed on exit
+            await self.close_page(app_id)
 
     async def run_loop(self):
         print("="*60)
@@ -829,6 +915,11 @@ class ApplyMateWorker:
         print(f"SQLite DB: {settings.SQLITE_DB_PATH}")
         print(f"Local AI Endpoint: {settings.LLAMA_CPP_URL}")
         print("="*60)
+
+        # Automatically recover any tasks left stuck in 'processing' from an earlier crash
+        recovered = recover_stuck_processing_applications()
+        if recovered > 0:
+            print(f"[Worker Startup] Recovered {recovered} application(s) stuck in 'processing' from previous crash.")
 
         while self.is_running:
             try:
@@ -857,12 +948,11 @@ class ApplyMateWorker:
                     await asyncio.sleep(settings.POLL_INTERVAL)
                     continue
 
-                # 3. Check for 'queued' tasks - Process OLDEST FIRST!
+                # 3. Check for 'queued' tasks - Atomically acquire OLDEST FIRST!
                 # STRICT GUARD: Never touch applications in 'needs_input', 'paused', or 'waiting_review'
-                queued_tasks = [a for a in apps if a.get("status") == "queued"]
-                if queued_tasks:
-                    queued_tasks.sort(key=lambda x: x.get("created_at") or "")
-                    await self.process_task(queued_tasks[0])
+                task_to_run = acquire_queued_application(self.worker_id)
+                if task_to_run:
+                    await self.process_task(task_to_run)
                     await asyncio.sleep(settings.POLL_INTERVAL)
                     continue
 
@@ -875,9 +965,19 @@ class ApplyMateWorker:
 
             await asyncio.sleep(settings.POLL_INTERVAL)
 
-if __name__ == "__main__":
+async def main_worker_entry():
     worker = ApplyMateWorker()
     try:
-        asyncio.run(worker.run_loop())
+        await worker.run_loop()
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        print("\n[Worker] Shutdown signal received. Performing graceful resource cleanup...")
+    finally:
+        worker.is_running = False
+        await worker.close_browser()
+        print("[Worker] Browser, context, and Playwright subprocess cleanly terminated.")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main_worker_entry())
     except KeyboardInterrupt:
-        print("\nWorker stopped by user.")
+        pass

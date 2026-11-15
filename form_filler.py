@@ -755,7 +755,8 @@ async def fill_form_on_page(
     saved_answers: List[Dict[str, Any]],
     resume_path: Optional[str] = None,
     job_context: str = "",
-    existing_form_data: Optional[Dict[str, Any]] = None
+    existing_form_data: Optional[Dict[str, Any]] = None,
+    application_id: str = ""
 ) -> Dict[str, Any]:
     """
     Intelligent Form Automation Engine (Sequential Top-to-Bottom Scraper):
@@ -1089,7 +1090,7 @@ async def fill_form_on_page(
                     ai_decision = ""
                     if not is_sensitive_question(label):
                         print(f"[AI Reasoning] Querying Qwen with options for '{label[:60]}...'")
-                        ai_decision = await ai_generate_tailored_answer(label, profile, job_context=job_context, options=options)
+                        ai_decision = await ai_generate_tailored_answer(label, profile, job_context=job_context, options=options, application_id=application_id)
                         print(f"[AI Decision] Qwen chose: '{ai_decision}' from {options[:5]}...")
 
                     collect_unanswered_question(
@@ -1105,7 +1106,7 @@ async def fill_form_on_page(
                     fallback_options = ["Yes", "No"]
                     ai_decision = ""
                     if not is_sensitive_question(label):
-                        ai_decision = await ai_generate_tailored_answer(label, profile, job_context=job_context, options=fallback_options)
+                        ai_decision = await ai_generate_tailored_answer(label, profile, job_context=job_context, options=fallback_options, application_id=application_id)
                     collect_unanswered_question(
                         field_id=field_id,
                         label=label,
@@ -1118,7 +1119,7 @@ async def fill_form_on_page(
                 else:
                     ai_decision = ""
                     if not is_sensitive_question(label):
-                        ai_decision = await ai_generate_tailored_answer(label, profile, job_context=job_context) or ""
+                        ai_decision = await ai_generate_tailored_answer(label, profile, job_context=job_context, application_id=application_id) or ""
                     collect_unanswered_question(
                         field_id=field_id,
                         label=label,
@@ -1232,7 +1233,7 @@ async def fill_form_on_page(
                 ai_decision = ""
                 if opt_texts and not is_sensitive_question(label):
                     opt_texts_to_pass = opt_texts[:20]
-                    ai_decision = await ai_generate_tailored_answer(label, profile, job_context=job_context, options=opt_texts_to_pass)
+                    ai_decision = await ai_generate_tailored_answer(label, profile, job_context=job_context, options=opt_texts_to_pass, application_id=application_id)
 
                 field_id = await el.get_attribute("id") or name or label
                 collect_unanswered_question(
@@ -1289,7 +1290,7 @@ async def fill_form_on_page(
                 # Pause on unknown radio group -> Collect into batch
                 ai_decision = ""
                 if not is_sensitive_question(group_label):
-                    ai_decision = await ai_generate_tailored_answer(group_label, profile, job_context=job_context, options=radio_options or ["Yes", "No"])
+                    ai_decision = await ai_generate_tailored_answer(group_label, profile, job_context=job_context, options=radio_options or ["Yes", "No"], application_id=application_id)
                 field_id = await el.get_attribute("id") or name or group_label
                 collect_unanswered_question(
                     field_id=field_id,
@@ -1443,7 +1444,7 @@ async def fill_form_on_page(
 
                 # Pause on unknown text / custom questions -> Collect into batch
                 field_id = await el.get_attribute("id") or name or label
-                suggested_ans = await ai_generate_tailored_answer(label, profile, job_context=job_context) or ""
+                suggested_ans = await ai_generate_tailored_answer(label, profile, job_context=job_context, application_id=application_id) or ""
 
                 collect_unanswered_question(
                     field_id=field_id,

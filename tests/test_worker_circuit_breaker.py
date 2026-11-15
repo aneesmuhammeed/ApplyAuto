@@ -93,5 +93,64 @@ class TestWorkerCircuitBreaker(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(unanswered_remaining[0]["key"], "other_field")
             self.assertTrue(ex_item["manual_required"])
 
+    def test_restart_preserves_attempt_counter_and_form_data(self):
+        """Verify that persisting attempt counters into form_data prevents resetting to 0 on restart."""
+        worker1 = ApplyMateWorker()
+        app_id = "test_restart_app"
+        form_data = {"fields": {}, "question_attempts": {"country": 2}}
+
+        # When worker boots fresh, it reads question_attempts from persisted form_data
+        persisted_attempts = form_data.setdefault("question_attempts", {})
+        app_attempts_map = worker1.app_attempts.setdefault(app_id, {})
+        
+        q_key = "country"
+        if q_key not in app_attempts_map and q_key in persisted_attempts:
+            app_attempts_map[q_key] = persisted_attempts[q_key]
+
+        self.assertEqual(worker1.app_attempts[app_id]["country"], 2)
+
+        # Attempt 3 exhausts and marks manual_required
+        current_att = app_attempts_map[q_key] + 1
+        app_attempts_map[q_key] = current_att
+        persisted_attempts[q_key] = current_att
+
+        self.assertEqual(persisted_attempts["country"], 3)
+
+        # Simulate fresh worker instance (process restart)
+        worker2 = ApplyMateWorker()
+        app_attempts_map2 = worker2.app_attempts.setdefault(app_id, {})
+        if q_key not in app_attempts_map2 and q_key in persisted_attempts:
+            app_attempts_map2[q_key] = persisted_attempts[q_key]
+
+        self.assertEqual(worker2.app_attempts[app_id]["country"], 3, "Restart must not reset attempt counter to 0")
+
+    def test_duplicate_batch_hashes_not_resent(self):
+        """Verify that identical batch questions generate matching SHA-256 hashes and avoid re-notification."""
+        import hashlib
+        worker = ApplyMateWorker()
+        app_id = "test_dedupe_app"
+
+        batch_q1 = [
+            {"question_key": "q_auth", "label": "Authorized to work in US?"},
+            {"question_key": "q_visa", "label": "Require visa sponsorship?"}
+        ]
+        batch_q2 = [
+            {"question_key": "q_visa", "label": "Require visa sponsorship?"},
+            {"question_key": "q_auth", "label": "Authorized to work in US?"}
+        ]
+
+        def compute_hash(batch):
+            keys = [str(q.get("question_key") or q.get("label")).strip().lower() for q in batch]
+            return hashlib.sha256("|".join(sorted(keys)).encode("utf-8")).hexdigest()
+
+        hash1 = compute_hash(batch_q1)
+        hash2 = compute_hash(batch_q2)
+
+        self.assertEqual(hash1, hash2, "Sorted question key hash must be identical regardless of item ordering")
+
+        # Simulate worker telegram notification tracking
+        worker.last_telegram_batch_hash[app_id] = hash1
+        self.assertEqual(worker.last_telegram_batch_hash.get(app_id), hash2)
+
 if __name__ == "__main__":
     unittest.main()

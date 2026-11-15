@@ -12,7 +12,9 @@ DB_PATH = settings.SQLITE_DB_PATH
 
 def get_db_connection():
     os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -710,6 +712,48 @@ def update_application(app_id: str, updates: Dict[str, Any]):
     conn.execute(f"UPDATE applications SET {cols} WHERE id = ?", values)
     conn.commit()
     conn.close()
+
+def acquire_queued_application(worker_id: str = "laptop-worker") -> Optional[Dict[str, Any]]:
+    """
+    Atomically acquire the oldest 'queued' application to ensure no two workers or polling cycles
+    ever claim the same task concurrently. Uses an immediate UPDATE ... WHERE status='queued' transaction.
+    """
+    conn = get_db_connection()
+    try:
+        now = time.strftime('%Y-%m-%d %H:%M:%S')
+        with conn:
+            # Find the oldest queued application
+            row = conn.execute("SELECT id FROM applications WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1").fetchone()
+            if not row:
+                return None
+            app_id = row["id"]
+            # Atomically update to processing
+            cursor = conn.execute(
+                "UPDATE applications SET status = 'processing', stage_message = 'Worker processing application...', updated_at = ? WHERE id = ? AND status = 'queued'",
+                (now, app_id)
+            )
+            if cursor.rowcount == 0:
+                return None
+        return get_application(app_id)
+    finally:
+        conn.close()
+
+def recover_stuck_processing_applications(timeout_seconds: int = 300) -> int:
+    """
+    Reset applications stuck in 'processing' state back to 'queued' or paused after an unexpected crash.
+    """
+    conn = get_db_connection()
+    try:
+        now = time.strftime('%Y-%m-%d %H:%M:%S')
+        with conn:
+            cursor = conn.execute("""
+            UPDATE applications
+            SET status = 'queued', stage_message = 'Recovered stuck task after restart', updated_at = ?
+            WHERE status = 'processing'
+            """, (now,))
+            return cursor.rowcount
+    finally:
+        conn.close()
 
 def delete_application(app_id: str):
     conn = get_db_connection()
