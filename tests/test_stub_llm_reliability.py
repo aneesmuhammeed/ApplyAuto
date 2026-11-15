@@ -183,5 +183,41 @@ class TestStubLLMReliability(unittest.IsolatedAsyncioTestCase):
             q_item = next(q for q in res["unanswered_questions"] if q["label"] == "Please specify your current visa category and expiry")
             self.assertEqual(q_item["ai_suggestion"], stub_free_text)
 
+    # =========================================================================
+    # 5. Think Tag Stripping and Option Index Parsing
+    # =========================================================================
+    async def test_think_tag_stripping_and_index_parsing(self):
+        """Verify Qwen <think>...</think> tokens are stripped and option index JSON is properly parsed."""
+        options = ["Software Engineering", "Product Design", "Marketing"]
+
+        # Scenario 1: Model outputs verbose <think>...</think> block before valid JSON with index
+        stub_with_think = """<think>
+The user is asking for the role. The candidate profile lists React and FastAPI.
+Option 0 is Software Engineering.
+</think>
+{"index": 0, "confidence": 0.95}"""
+
+        with patch("ai_client.call_qwen", new_callable=AsyncMock) as mock_qwen:
+            mock_qwen.return_value = stub_with_think
+            decision = await ai_generate_tailored_answer(
+                question_text="Preferred Department",
+                candidate_profile={"skills": ["React", "FastAPI"]},
+                options=options
+            )
+            self.assertEqual(decision, "Software Engineering")
+
+        clear_llm_cache()
+
+        # Scenario 2: Legacy option_index format with confidence
+        stub_legacy = """{"option_index": 1, "confidence": 0.88}"""
+        with patch("ai_client.call_qwen", new_callable=AsyncMock) as mock_qwen:
+            mock_qwen.return_value = stub_legacy
+            decision = await ai_generate_tailored_answer(
+                question_text="Preferred Department",
+                candidate_profile={},
+                options=options
+            )
+            self.assertEqual(decision, "Product Design")
+
 if __name__ == "__main__":
     unittest.main()

@@ -818,9 +818,15 @@ class CustomComboboxWidgetExecutor(BaseWidgetExecutor):
             const s2 = container.querySelector('[class*="singleValue"]');
             if (s2 && s2.innerText && s2.innerText.trim()) return s2.innerText.trim();
 
-            // 3. .select2-selection__rendered
+            // 3. .select2-selection__rendered (skip placeholder text like "Select a ...")
             const s3 = container.querySelector('.select2-selection__rendered, [class*="selection__rendered"]');
-            if (s3 && s3.innerText && s3.innerText.trim()) return s3.innerText.trim();
+            if (s3 && s3.innerText && s3.innerText.trim()) {
+                const s3Txt = s3.innerText.trim();
+                const isPlaceholder = new RegExp('^(select|choose|please select|select an option|select a country|select one)\\\\b', 'i').test(s3Txt);
+                if (!isPlaceholder) {
+                    return s3Txt;
+                }
+            }
 
             // 4. .iti__selected-dial-code
             const s4 = container.querySelector('.iti__selected-dial-code');
@@ -872,7 +878,8 @@ class CustomComboboxWidgetExecutor(BaseWidgetExecutor):
                     return aria;
                 }
                 const acText = (ac.innerText || '').trim();
-                if (acText && !['select', 'choose', 'open', 'select an option'].includes(acText.toLowerCase())) {
+                const isAcPlaceholder = new RegExp('^(select|choose|please select|select an option|select a country|select one)\\\\b', 'i').test(acText);
+                if (acText && !isAcPlaceholder && !['select', 'choose', 'open', 'select an option'].includes(acText.toLowerCase())) {
                     return acText;
                 }
             }
@@ -891,7 +898,13 @@ class CustomComboboxWidgetExecutor(BaseWidgetExecutor):
         if not curr_clean:
             try:
                 curr_clean = await element.evaluate("""el => {
-                    return (el.value || el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+                    const h = el.querySelector('input[type="hidden"]');
+                    if (h && h.value && h.value.trim()) return h.value.trim();
+                    const val = el.value || el.getAttribute('aria-label') || el.getAttribute('title') || '';
+                    if (val && !new RegExp('^(select|choose|please select|select an option|select a country|select one)\\\\b', 'i').test(val.trim())) {
+                        return val.trim();
+                    }
+                    return '';
                 }""")
             except Exception:
                 pass

@@ -280,5 +280,48 @@ class TestFixturesWidgets(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(v_ok_p)
         self.assertEqual(read_val_p, "India")
 
+    # =========================================================================
+    # 10. Edge Cases: Display Matching, Hidden Input Combobox, and Strict Type Detection
+    # =========================================================================
+    async def test_edge_cases_matching_and_type_detection(self):
+        from widget_executors import display_matches, detect_widget_type
+
+        # 1. Test display_matches unit logic
+        self.assertTrue(display_matches("India +91", "+91"))
+        self.assertTrue(display_matches("India +91", "India"))
+        self.assertTrue(display_matches("India +91", "India +91"))
+        self.assertTrue(display_matches("+91", "India +91"))
+        self.assertFalse(display_matches("India +91", "+1"))
+        self.assertFalse(display_matches("India +91", "United States"))
+
+        page = await self.context.new_page()
+        await page.goto(get_fixture_url("edge_cases_widgets.html"))
+
+        cb_exec = widget_registry.get_executor(WidgetType.CUSTOM_COMBOBOX)
+
+        # 2. React-select dial code showing only "+91"
+        dc_el = await page.wait_for_selector("#dial-code-input")
+        ok_dc, read_dc = await cb_exec.verify(page, dc_el, "India +91")
+        self.assertTrue(ok_dc, f"Should verify successfully against displayed '+91': read '{read_dc}'")
+        self.assertEqual(read_dc, "+91")
+
+        # 3. Combobox whose value lives only in a hidden input
+        hidden_box = await page.wait_for_selector("#select2-country-box")
+        # Set hidden input value to 'India'
+        await page.evaluate("() => document.getElementById('hidden-country-val').value = 'India'")
+        ok_h, read_h = await cb_exec.verify(page, hidden_box, "India")
+        self.assertTrue(ok_h, f"Should read from hidden input: read '{read_h}'")
+        self.assertEqual(read_h, "India")
+
+        # 4. Native select inside div with class "select-wrapper" (Must NOT detect as CUSTOM_COMBOBOX)
+        native_sel = await page.wait_for_selector("#native-work-auth")
+        detected_sel_type = await detect_widget_type(page, native_sel)
+        self.assertEqual(detected_sel_type, WidgetType.NATIVE_SELECT, "Native select in .select-wrapper must detect as NATIVE_SELECT")
+
+        # 5. Text input inside div with class "selectable" (Must NOT detect as CUSTOM_COMBOBOX)
+        text_el = await page.wait_for_selector("#candidate-github")
+        detected_text_type = await detect_widget_type(page, text_el)
+        self.assertEqual(detected_text_type, WidgetType.TEXT, "Input in .selectable must detect as TEXT")
+
 if __name__ == "__main__":
     unittest.main()

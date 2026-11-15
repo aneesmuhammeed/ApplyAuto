@@ -140,5 +140,30 @@ class TestTelegramBotHardening(unittest.TestCase):
         self.assertFalse(telegram_enabled())
         self.assertEqual(mock_urlopen.call_count, 1)
 
+    @patch("urllib.request.urlopen")
+    @patch.dict(os.environ, {
+        "TELEGRAM_BOT_TOKEN": '  "123456789:ABCdefGHIjklMNOpqrsTUVwxyz_123456" \n',
+        "TELEGRAM_CHAT_ID": " ' 987654321 ' "
+    })
+    def test_telegram_enabled_with_quoted_and_whitespace_values(self, mock_urlopen):
+        """telegram_enabled strips quotes and whitespace correctly and succeeds if getMe is ok."""
+        mock_get_me = MagicMock()
+        mock_get_me.status = 200
+        mock_get_me.read.return_value = b'{"ok": true, "result": {"username": "ApplyMateBot"}}'
+        mock_get_me.__enter__.return_value = mock_get_me
+        mock_urlopen.return_value = mock_get_me
+
+        self.assertTrue(telegram_enabled())
+        req = mock_urlopen.call_args[0][0]
+        self.assertEqual(req.full_url, "https://api.telegram.org/bot123456789:ABCdefGHIjklMNOpqrsTUVwxyz_123456/getMe")
+
+    @patch.dict(os.environ, {
+        "TELEGRAM_BOT_TOKEN": "your_bot_token_here",
+        "TELEGRAM_CHAT_ID": "your_chat_id_here"
+    })
+    def test_telegram_enabled_with_placeholders(self):
+        """telegram_enabled rejects template placeholders immediately without network calls."""
+        self.assertFalse(telegram_enabled())
+
 if __name__ == "__main__":
     unittest.main()

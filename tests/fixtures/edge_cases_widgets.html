@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Edge Cases Form</title>
+</head>
+<body>
+  <form id="edge-cases-form">
+    <!-- 1. React-select-style dial-code combobox whose selected value shows only "+91" -->
+    <div id="dial-code-wrapper" class="form-group">
+      <label for="dial-code-input">Phone Country Code</label>
+      <div class="select__container" id="dial-code-container">
+        <div class="select__control" id="dial-code-control" role="combobox" aria-haspopup="listbox" aria-expanded="false" aria-controls="dial-code-listbox">
+          <span class="select__single-value iti__selected-dial-code">+91</span>
+          <input id="dial-code-input" class="select__input" type="text" autocomplete="off" />
+        </div>
+        <div id="dial-code-listbox" role="listbox" class="select__menu" style="display: none;">
+          <div role="option" class="select__option" id="opt-in" data-value="+91">India +91</div>
+          <div role="option" class="select__option" id="opt-us" data-value="+1">United States +1</div>
+          <div role="option" class="select__option" id="opt-uk" data-value="+44">United Kingdom +44</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 2. Combobox whose value lives only in a hidden input -->
+    <div id="hidden-val-wrapper" class="form-group">
+      <label id="lbl-custom-country">Residence Country</label>
+      <div class="select2-container" id="select2-country-box" role="combobox" aria-labelledby="lbl-custom-country" aria-controls="country-listbox">
+        <input type="hidden" name="country_iso" id="hidden-country-val" value="" />
+        <span class="select2-selection__rendered">Select a country</span>
+      </div>
+      <div id="country-listbox" role="listbox" style="display: none;">
+        <div role="option" class="select2-results__option" data-iso="IN">India</div>
+        <div role="option" class="select2-results__option" data-iso="US">United States</div>
+      </div>
+    </div>
+
+    <!-- 3. Native select inside a div with class "select-wrapper" (Must NOT be misrouted as CUSTOM_COMBOBOX) -->
+    <div class="select-wrapper">
+      <label for="native-work-auth">Are you legally authorized to work?</label>
+      <select id="native-work-auth" name="work_auth">
+        <option value="">-- Please Select --</option>
+        <option value="yes">Yes</option>
+        <option value="no">No</option>
+      </select>
+    </div>
+
+    <!-- 4. Text input inside "selectable" container (Must NOT be misrouted as CUSTOM_COMBOBOX) -->
+    <div class="selectable-row selectable item-selectable">
+      <label for="candidate-github">GitHub Profile</label>
+      <input type="text" id="candidate-github" name="github_url" placeholder="https://github.com/..." />
+    </div>
+  </form>
+
+  <script>
+    // Simple interactive behavior for testing
+    const dcControl = document.getElementById('dial-code-control');
+    const dcMenu = document.getElementById('dial-code-listbox');
+    dcControl.addEventListener('click', () => {
+      dcMenu.style.display = dcMenu.style.display === 'none' ? 'block' : 'none';
+      dcControl.setAttribute('aria-expanded', dcMenu.style.display === 'block');
+    });
+
+    const s2Box = document.getElementById('select2-country-box');
+    const s2Menu = document.getElementById('country-listbox');
+    s2Box.addEventListener('click', () => {
+      s2Menu.style.display = s2Menu.style.display === 'none' ? 'block' : 'none';
+    });
+  </script>
+</body>
+</html>
