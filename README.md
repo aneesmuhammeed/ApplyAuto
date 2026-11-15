@@ -194,6 +194,46 @@ pytest tests -v
 pytest tests/test_fixtures_widgets.py -v
 pytest tests/test_conditional_and_dynamic.py -v
 pytest tests/test_stub_llm_reliability.py -v
+pytest tests/test_telegram_bot.py -v
+pytest tests/test_worker_circuit_breaker.py -v
+pytest tests/test_config_and_api_auth.py -v
+pytest tests/test_database_and_resume_audit.py -v
 ```
 
-GitHub Actions automatically runs this test suite on every push and pull request across Linux with headless Chromium.
+GitHub Actions automatically runs this test suite on every push and pull request across Ubuntu and Windows matrices.
+
+---
+
+## 🔧 Troubleshooting Guide
+
+### 1. Telegram Notifications Returning HTTP 404
+- **Symptom**: `[Telegram Warning] TELEGRAM_BOT_TOKEN is invalid (HTTP 404 Not Found from getMe)`.
+- **Cause**: The `TELEGRAM_BOT_TOKEN` in `.env` contains the default placeholder (`your_telegram_bot_token_here`), accidental surrounding quotes, extra whitespace, or is missing the `<bot_id>:<secret>` colon.
+- **Resolution**:
+  - If you do not plan to use Telegram, leave the key as placeholder or unset. ApplyMate checks credentials once at startup via `getMe`, disables Telegram cleanly, and skips dispatch without looping or failing.
+  - If using Telegram, obtain a token from `@BotFather`, paste it bare without quotes, and ensure your `TELEGRAM_CHAT_ID` matches your personal numeric ID.
+
+### 2. Local LLM Returning 'None' or Low Confidence
+- **Symptom**: `[AI Decision] Qwen chose: 'None'` for simple multiple-choice questions.
+- **Cause**:
+  1. Small context window (`-c 2048` or default 512) overflows on long forms or prompts.
+  2. Model emits chain-of-thought `<think>...</think>` tags before the JSON structure.
+- **Resolution**:
+  - Always launch `llama-server` with `-c 8192`:
+    ```powershell
+    llama-server -m models/qwen2.5-3b-instruct-q4_k_m.gguf -c 8192 --port 1234
+    ```
+  - ApplyMate automatically appends `/no_think` to prompts, strips `<think>` tags via regular expressions, and requests an option index format (`{"index": n, "confidence": 0-1}`) with temperature 0.
+
+### 3. Country / Phone Dial Code Dropdowns Retrying
+- **Symptom**: Large country dropdowns (240+ countries) fail verification or loop.
+- **Cause**: Dial-code widgets display country as flag + `+91` or store selection only in hidden inputs, while options lists exceed LLM prompt sizes.
+- **Resolution**:
+  - ApplyMate automatically bypasses options lists > 30 entries and derives the candidate's country deterministically from the profile location or country field.
+  - `CustomComboboxWidgetExecutor` verifies values through an 8-step hierarchy inspecting `.select__single-value`, `[class*="selected-dial-code"]`, hidden inputs, and text inputs without relying on container innerText placeholders.
+
+### 4. Windows "closed pipe" or `BaseSubprocessTransport.__del__` on Ctrl+C
+- **Symptom**: On Windows asyncio with Python 3.12, pressing Ctrl+C yields `ValueError: I/O operation on closed pipe` from Playwright.
+- **Cause**: Windows Proactor event loop tearing down subprocess pipes before browser contexts close.
+- **Resolution**:
+  - ApplyMate manages worker lifecycle in `main_worker_entry()` with an explicit `try/finally` block that cleanly awaits `close_browser()` and shuts down Playwright before loop teardown.

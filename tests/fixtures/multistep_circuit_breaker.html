@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Multi-Step ATS Application Test</title>
+  <style>
+    body { font-family: sans-serif; padding: 20px; }
+    .form-group { margin-bottom: 15px; }
+    label { display: block; margin-bottom: 5px; font-weight: bold; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <h2>Job Application Form</h2>
+
+  <form id="multi-step-form">
+    <!-- Step 1: Standard personal details -->
+    <div id="step-1">
+      <div class="form-group">
+        <label for="applicant_name">Full Legal Name *</label>
+        <input type="text" id="applicant_name" name="applicant_name" required>
+      </div>
+
+      <div class="form-group">
+        <label for="applicant_email">Email Address *</label>
+        <input type="email" id="applicant_email" name="applicant_email" required>
+      </div>
+
+      <!-- Question that will fail verification: read-only input that rejects typing -->
+      <div class="form-group">
+        <label for="failing_field">Special License Number *</label>
+        <input type="text" id="failing_field" name="failing_field" readonly value="" placeholder="Enter License Number">
+      </div>
+
+      <!-- General question that succeeds -->
+      <div class="form-group">
+        <label for="work_pref">Work Location Preference</label>
+        <select id="work_pref" name="work_pref">
+          <option value="">-- Choose preference --</option>
+          <option value="Remote">Remote</option>
+          <option value="Hybrid">Hybrid</option>
+          <option value="On-site">On-site</option>
+        </select>
+      </div>
+    </div>
+  </form>
+</body>
+</html>

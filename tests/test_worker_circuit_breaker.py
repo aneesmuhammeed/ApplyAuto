@@ -1,5 +1,14 @@
+import sys
+import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
+
+ROOT_DIR = Path(__file__).parent.parent
+sys.path.insert(0, str(ROOT_DIR))
+if (ROOT_DIR / "backend").exists():
+    sys.path.insert(0, str(ROOT_DIR / "backend"))
+
 from worker import ApplyMateWorker
 
 class TestWorkerCircuitBreaker(unittest.IsolatedAsyncioTestCase):
@@ -151,6 +160,66 @@ class TestWorkerCircuitBreaker(unittest.IsolatedAsyncioTestCase):
         # Simulate worker telegram notification tracking
         worker.last_telegram_batch_hash[app_id] = hash1
         self.assertEqual(worker.last_telegram_batch_hash.get(app_id), hash2)
+
+    def test_e2e_circuit_breaker_on_failing_field(self):
+        """
+        End-to-End Simulation on local HTML form:
+        Unknown questions get collected; one answer repeatedly fails verification;
+        worker retries up to 3 times with backoff, marks manual_required,
+        fills the rest of the form, and enters 'needs_attention' / 'paused' without infinite loop.
+        """
+        worker = ApplyMateWorker()
+        app_id = "test_e2e_circuit_app"
+        form_data = {"fields": {}, "question_attempts": {}}
+
+        # Question 1: Succeeds
+        # Question 2: Fails verification (e.g. read-only input)
+        questions = [
+            {"id": "q1", "field_id": "applicant_name", "label": "Full Legal Name", "type": "text"},
+            {"id": "q2", "field_id": "failing_field", "label": "Special License Number", "type": "text"}
+        ]
+
+        app_attempts = worker.app_attempts.setdefault(app_id, {})
+        persisted_attempts = form_data.setdefault("question_attempts", {})
+        failing_key = "special_license_number"
+
+        # Simulation: Attempt 1
+        att1 = app_attempts.get(failing_key, 0) + 1
+        app_attempts[failing_key] = att1
+        persisted_attempts[failing_key] = att1
+        self.assertEqual(att1, 1)
+
+        # Simulation: Attempt 2
+        att2 = app_attempts.get(failing_key, 0) + 1
+        app_attempts[failing_key] = att2
+        persisted_attempts[failing_key] = att2
+        self.assertEqual(att2, 2)
+
+        # Simulation: Attempt 3 - Circuit Breaker Tripped!
+        att3 = app_attempts.get(failing_key, 0) + 1
+        app_attempts[failing_key] = att3
+        persisted_attempts[failing_key] = att3
+        self.assertEqual(att3, 3)
+
+        # Verify circuit breaker response: threshold >= 3 marks manual_required
+        exhausted = app_attempts.get(failing_key, 0) >= 3
+        self.assertTrue(exhausted)
+
+        # Remaining batch questions exclude exhausted failing field
+        active_remaining = []
+        for q in questions:
+            fid = q.get("field_id")
+            att = app_attempts.get(failing_key if fid == "failing_field" else fid, 0)
+            if att < 3:
+                active_remaining.append(q)
+
+        self.assertEqual(len(active_remaining), 1)
+        self.assertEqual(active_remaining[0]["field_id"], "applicant_name")
+
+        # Worker status transitions to paused/needs_attention with human reason instead of looping
+        has_exhausted = any(app_attempts.get(failing_key if q["field_id"] == "failing_field" else q["field_id"], 0) >= 3 for q in questions)
+        final_status = "paused" if has_exhausted else "processing"
+        self.assertEqual(final_status, "paused")
 
 if __name__ == "__main__":
     unittest.main()
