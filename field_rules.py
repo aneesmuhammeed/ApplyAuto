@@ -35,8 +35,10 @@ def get_field_match_by_rules(label: str, profile: Dict[str, Any]) -> Optional[st
     # 4. GENERIC CURRENT LOCATION / CITY / ADDRESS
     # =========================================================================
     if not any(w in lbl for w in ["willing", "relocate", "relocation", "prefer", "office", "hear", "source"]):
-        if re.search(r'^(location|current\s*location|location\s*\(city\)|city|address|current\s*address)$', lbl):
-            return profile.get("location") or profile.get("current_location") or None
+        if re.search(r'^(city|current\s*city)$', lbl):
+            return profile.get("city") or profile.get("location") or profile.get("current_location") or None
+        if re.search(r'^(location|current\s*location|location\s*\(city\)|address|current\s*address)$', lbl):
+            return profile.get("location") or profile.get("current_location") or profile.get("city") or None
 
     # =========================================================================
     # 5. SPECIFIC TOTAL EXPERIENCE (Years / Months)
@@ -66,15 +68,15 @@ def get_field_match_by_rules(label: str, profile: Dict[str, Any]) -> Optional[st
     # =========================================================================
     # 7. CANDIDATE NAMES (First, Last, Full Name)
     # =========================================================================
-    full_name = profile.get("full_name", "")
+    full_name = (profile.get("full_name") or "").strip()
     name_parts = full_name.split() if full_name else []
-    first_name = name_parts[0] if name_parts else ""
-    last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
+    first_name = profile.get("first_name") or (name_parts[0] if name_parts else "")
+    last_name = profile.get("last_name") or (" ".join(name_parts[1:]) if len(name_parts) > 1 else "")
 
     if re.search(r'\b(first(\s*|_)?name|given(\s*|_)?name)\b', lbl):
         return first_name or None
     if re.search(r'\b(last(\s*|_)?name|surname|family(\s*|_)?name)\b', lbl):
-        return last_name or first_name or None
+        return last_name or None
     if re.search(r'\b(full(\s*|_)?name|your\s*name|candidate\s*name)\b', lbl):
         return full_name or None
     if re.search(r'^(name|applicant\s*name)$', lbl):
@@ -100,8 +102,10 @@ def get_field_match_by_rules(label: str, profile: Dict[str, Any]) -> Optional[st
             if profile.get("country"):
                 return profile["country"]
             loc = profile.get("location", "")
-            if loc and "india" in loc.lower():
-                return "India"
+            if loc:
+                parts = [p.strip() for p in loc.split(",") if p.strip()]
+                if parts:
+                    return parts[-1]
             return loc or None
 
     # =========================================================================

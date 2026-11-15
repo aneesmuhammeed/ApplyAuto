@@ -460,7 +460,7 @@ def is_intent_plausible(intent: str, label: str) -> bool:
 
 async def map_intent_to_profile(intent: str, profile: Dict[str, Any]) -> Optional[str]:
     """Map validated field intent to candidate profile facts."""
-    full_name = profile.get("full_name", "")
+    full_name = (profile.get("full_name") or "").strip()
     parts = full_name.split() if full_name else []
     first_name = profile.get("first_name") or (parts[0] if parts else "")
     last_name = profile.get("last_name") or (" ".join(parts[1:]) if len(parts) > 1 else "")
@@ -469,7 +469,7 @@ async def map_intent_to_profile(intent: str, profile: Dict[str, Any]) -> Optiona
     mapping = {
         "full_name": full_name,
         "first_name": first_name,
-        "last_name": last_name or first_name,
+        "last_name": last_name or "",
         "email": profile.get("email", ""),
         "phone": profile.get("phone", ""),
         "location": profile.get("location", "") or city,
@@ -1009,9 +1009,9 @@ async def fill_form_on_page(
                 # A. Country combobox
                 is_country_field = bool(re.search(r'^(country|your\s*country|country\s*[\/\-]\s*region|country\s*of\s*residence)$', label.lower().strip()))
                 if is_country_field:
-                    country_val = "India"
-                    if profile.get("location") and "india" in profile.get("location", "").lower():
-                        country_val = "India"
+                    loc_val = profile.get("location") or ""
+                    loc_parts = [p.strip() for p in loc_val.split(",") if p.strip()]
+                    country_val = profile.get("country") or (loc_parts[-1] if loc_parts else "India")
                     cb_exec = widget_registry.get_executor(WidgetType.CUSTOM_COMBOBOX)
                     exec_res = await cb_exec.execute(ctx, el, country_val)
                     if exec_res.success:
