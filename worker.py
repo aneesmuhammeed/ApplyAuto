@@ -10,7 +10,8 @@ from config import settings
 from database import (
     get_profile, get_saved_answers, get_applications, get_application,
     update_application, update_worker_heartbeat, create_saved_answer,
-    acquire_queued_application, recover_stuck_processing_applications
+    acquire_queued_application, recover_stuck_processing_applications,
+    calculate_profile_completeness
 )
 from form_filler import (
     fill_form_on_page, detect_security_checkpoint, detect_login_wall,
