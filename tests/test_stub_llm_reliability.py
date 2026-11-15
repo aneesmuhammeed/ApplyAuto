@@ -219,5 +219,32 @@ Option 0 is Software Engineering.
             )
             self.assertEqual(decision, "Product Design")
 
+        clear_llm_cache()
+
+        # Scenario 3: Large options list (> 30) must bypass LLM
+        many_options = [f"Option {i}" for i in range(40)]
+        with patch("ai_client.call_qwen", new_callable=AsyncMock) as mock_qwen:
+            mock_qwen.return_value = '{"index": 5, "confidence": 0.99}'
+            decision_large = await ai_generate_tailored_answer(
+                question_text="Select random code",
+                candidate_profile={},
+                options=many_options
+            )
+            self.assertIsNone(decision_large, "Options > 30 without deterministic rule must bypass LLM and ask user")
+            mock_qwen.assert_not_called()
+
+        clear_llm_cache()
+
+        # Scenario 4: Low confidence (< threshold) must return None ('ask user')
+        stub_low_conf = """{"index": 2, "confidence": 0.25}"""
+        with patch("ai_client.call_qwen", new_callable=AsyncMock) as mock_qwen:
+            mock_qwen.return_value = stub_low_conf
+            decision_low = await ai_generate_tailored_answer(
+                question_text="Complex role preference",
+                candidate_profile={},
+                options=options
+            )
+            self.assertIsNone(decision_low, "Low confidence (< threshold) must return None ('ask user')")
+
 if __name__ == "__main__":
     unittest.main()

@@ -153,43 +153,48 @@ async def call_qwen(
     if response_format:
         payload["response_format"] = response_format
 
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(endpoint, json=payload)
-            if resp.status_code == 200:
-                data = resp.json()
-                msg = data["choices"][0]["message"]
-                content = (msg.get("content") or "").strip()
-                reasoning = (msg.get("reasoning_content") or "").strip()
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(endpoint, json=payload)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    msg = data["choices"][0]["message"]
+                    content = (msg.get("content") or "").strip()
+                    reasoning = (msg.get("reasoning_content") or "").strip()
 
-                # Clean think tag artifacts (DOTALL)
-                content = re.sub(r'<think>[\s\S]*?</think>', '', content, flags=re.DOTALL).strip()
+                    # Clean think tag artifacts (DOTALL)
+                    content = re.sub(r'<think>[\s\S]*?</think>', '', content, flags=re.DOTALL).strip()
 
-                # If content is empty or incomplete but reasoning_content contains a decision/JSON, fallback to reasoning
-                if (not content or not ('{' in content and '}' in content)) and reasoning:
-                    clean_reasoning = re.sub(r'<think>[\s\S]*?</think>', '', reasoning, flags=re.DOTALL).strip()
-                    if '{' in clean_reasoning:
-                        return clean_reasoning
+                    # If content is empty or incomplete but reasoning_content contains a decision/JSON, fallback to reasoning
+                    if (not content or not ('{' in content and '}' in content)) and reasoning:
+                        clean_reasoning = re.sub(r'<think>[\s\S]*?</think>', '', reasoning, flags=re.DOTALL).strip()
+                        if '{' in clean_reasoning:
+                            return clean_reasoning
 
-                return content
-            elif resp.status_code == 400 and response_format and "response_format" in resp.text:
-                # If llama-server version does not support response_format, retry without it
-                payload.pop("response_format", None)
-                async with httpx.AsyncClient(timeout=timeout) as retry_client:
-                    retry_resp = await retry_client.post(endpoint, json=payload)
-                    if retry_resp.status_code == 200:
-                        retry_data = retry_resp.json()
-                        retry_msg = retry_data["choices"][0]["message"]
-                        retry_content = (retry_msg.get("content") or "").strip()
-                        return re.sub(r'<think>[\s\S]*?</think>', '', retry_content, flags=re.DOTALL).strip()
-                    print(f"[Local AI] Retry without response_format failed ({retry_resp.status_code}): {retry_resp.text}")
+                    return content
+                elif resp.status_code == 400 and payload.get("response_format") and "response_format" in resp.text:
+                    # If llama-server version does not support response_format, retry without it
+                    payload.pop("response_format", None)
+                    continue
+                else:
+                    print(f"[Local AI] Non-200 response from {endpoint}: {resp.status_code} - {resp.text}")
                     return None
-            else:
-                print(f"[Local AI] Non-200 response from {endpoint}: {resp.status_code} - {resp.text}")
-                return None
-    except Exception as e:
-        print(f"[Local AI] Request failed to {endpoint} ({model_name}): {e}")
-        return None
+        except (httpx.ConnectError, httpx.ConnectTimeout) as conn_err:
+            print(f"[Local AI] Server unreachable at {endpoint}. Ensure llama-server is running: {conn_err}")
+            return None
+        except httpx.TimeoutException:
+            if attempt == 0:
+                print(f"[Local AI] Request timeout ({timeout}s) to {endpoint}, retrying once with exponential backoff...")
+                await asyncio.sleep(1.0)
+                continue
+            print(f"[Local AI] Request timed out twice ({timeout}s) calling {endpoint}.")
+            return None
+        except Exception as e:
+            print(f"[Local AI] Request failed to {endpoint} ({model_name}): {e}")
+            return None
+
+    return None
 
 async def ai_interpret_field(label: str, tag_type: str = "text") -> Dict[str, Any]:
     """
@@ -384,6 +389,23 @@ async def ai_generate_tailored_answer(
         exp_sal = candidate_profile.get("expected_salary")
         return str(exp_sal) if exp_sal is not None and str(exp_sal).strip() else None
 
+    # Check deterministic profile rules before invoking local LLM
+    from field_rules import get_field_match_by_rules
+    deterministic_rule = get_field_match_by_rules(clean_q, candidate_profile)
+    if deterministic_rule is not None and str(deterministic_rule).strip():
+        if options:
+            from widget_executors import match_option_candidate
+            match_res = match_option_candidate(str(deterministic_rule), [(opt, opt) for opt in options])
+            if match_res:
+                chosen_opt = match_res[1]
+                print(f"[Deterministic Match] Resolved '{clean_q}' directly from profile to option: '{chosen_opt}'")
+                set_cached_llm_result(cache_key, "choice", chosen_opt)
+                return chosen_opt
+        else:
+            print(f"[Deterministic Match] Resolved '{clean_q}' directly from profile: '{deterministic_rule}'")
+            set_cached_llm_result(cache_key, "freetext", deterministic_rule)
+            return str(deterministic_rule)
+
     # =========================================================================
     # OPTION CHOICE PATH (JSON with option_index & confidence)
     # =========================================================================
@@ -394,11 +416,12 @@ async def ai_generate_tailored_answer(
             rule_match = get_field_match_by_rules(clean_q, candidate_profile)
             if rule_match:
                 from widget_executors import match_option_candidate
-                matched_cand, score = match_option_candidate(str(rule_match), options)
-                if matched_cand and score >= 0.70:
-                    print(f"[Option Pruning] Resolved large option list ({len(options)} options) deterministically for '{clean_q}': '{matched_cand}' (score: {score:.2f})")
-                    set_cached_llm_result(cache_key, "choice", matched_cand)
-                    return matched_cand
+                matched_cand = match_option_candidate(str(rule_match), [(opt, opt) for opt in options])
+                if matched_cand:
+                    chosen_opt = matched_cand[1]
+                    print(f"[Option Pruning] Resolved large option list ({len(options)} options) deterministically for '{clean_q}': '{chosen_opt}'")
+                    set_cached_llm_result(cache_key, "choice", chosen_opt)
+                    return chosen_opt
 
             # If deterministic matching fails on large options list, ask the user directly
             print(f"[Option Pruning] Option list too large ({len(options)} options) and deterministic profile matching failed for '{clean_q}'. Asking user.")

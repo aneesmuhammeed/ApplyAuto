@@ -6,10 +6,7 @@ from database import (
     get_persisted_embeddings, save_persisted_embedding
 )
 from field_rules import get_field_match_by_rules
-try:
-    from widget_executors import match_option_candidate
-except ImportError:
-    from backend.widget_executors import match_option_candidate
+from widget_executors import match_option_candidate
 
 class LookupStage:
     EXACT_MEMORY = "exact_memory"

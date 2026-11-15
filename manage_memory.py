@@ -110,6 +110,14 @@ def cmd_delete(args):
 
     full_id = matched[0]["id"]
     pat = matched[0].get("question_pattern")
+    ans = matched[0].get("answer")
+
+    if not getattr(args, "yes", False):
+        confirm = input(f"Are you sure you want to delete answer for '{pat}' -> '{ans}'? [y/N]: ").strip().lower()
+        if confirm not in ["y", "yes"]:
+            print("Deletion cancelled.")
+            return
+
     delete_saved_answer(full_id)
     print(f"Deleted saved answer '{full_id[:8]}' ('{pat}') from memory.")
 
@@ -152,6 +160,7 @@ def main():
     # delete
     p_del = subparsers.add_parser("delete", help="Delete a saved answer by ID")
     p_del.add_argument("id", help="Saved answer ID (or first 8 chars)")
+    p_del.add_argument("-y", "--yes", action="store_true", help="Confirm deletion without prompting")
 
     # add
     p_add = subparsers.add_parser("add", help="Add a new saved answer")
