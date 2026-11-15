@@ -384,7 +384,14 @@ class ApplyMateWorker:
                     ans_item["attempts"] = attempts
                     ans_item["last_error"] = err_msg
                     ans_item["verification_failed"] = True
-                    await self.log_app(app_id, f"[Verification Failed] (Attempt {attempts}/3) Value check failed for '{ans_lbl}': {err_msg}.")
+
+                    # Check if option click succeeded but value is unverified/unreadable in DOM
+                    if exec_res.meta.get("unverified"):
+                        ans_item["unverified"] = True
+                        ans_item["needs_manual_confirmation"] = True
+                        await self.log_app(app_id, f"[Combobox Unverified] Option clicked for '{ans_lbl}', but displayed value is unreadable in DOM. Flagged for manual confirmation.")
+                    else:
+                        await self.log_app(app_id, f"[Verification Failed] (Attempt {attempts}/3) Value check failed for '{ans_lbl}': {err_msg}.")
                     remaining_batch.append(ans_item)
 
             saved_answers = get_saved_answers()
@@ -394,6 +401,7 @@ class ApplyMateWorker:
             if remaining_batch:
                 # Check for max retry exhaustion (backoff / circuit breaker)
                 exhausted = [item for item in remaining_batch if item.get("attempts", 0) >= 3]
+                unverified_items = [item for item in remaining_batch if item.get("unverified")]
                 screenshot = await self.capture_screenshot(page)
                 if exhausted:
                     ex_lbl = exhausted[0].get("label") or "Question"
@@ -407,6 +415,23 @@ class ApplyMateWorker:
                         "unanswered_questions": remaining_batch,
                         "unanswered_question": remaining_batch[0],
                         "stage_message": pause_msg,
+                        "review_screenshot_url": screenshot,
+                        "form_data": persisted_form_data
+                    })
+                    return
+
+                # If option click succeeded but value is unverified in DOM, flag for manual confirmation instead of looping
+                if unverified_items:
+                    u_lbl = unverified_items[0].get("label") or "Field"
+                    u_msg = f"Field '{u_lbl}' option was selected, but displayed value could not be confirmed in DOM. Flagged for manual confirmation."
+                    await self.log_app(app_id, f"[Manual Confirmation Required] {u_msg}")
+                    update_application(app_id, {
+                        "status": "needs_input",
+                        "batch_answers": [],
+                        "user_answer": None,
+                        "unanswered_questions": remaining_batch,
+                        "unanswered_question": unverified_items[0],
+                        "stage_message": u_msg,
                         "review_screenshot_url": screenshot,
                         "form_data": persisted_form_data
                     })

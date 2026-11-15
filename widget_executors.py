@@ -133,19 +133,30 @@ class BaseWidgetExecutor:
 
     async def execute(self, ctx: Union[Page, Frame], element: ElementHandle, value: Any, **kwargs) -> ExecutionResult:
         """
-        Executes fill, immediately re-reads DOM to verify value, applies fallback if verification fails,
-        and re-reads again to guarantee value integrity.
+        Executes fill, immediately re-reads DOM to verify value, applies fallback if verification fails
+        or fill() returns False, and re-reads again to guarantee value integrity.
         """
         try:
             # 1. Fill step
             fill_ok = await self.fill(ctx, element, value, **kwargs)
+            fill_reason = None
             if not fill_ok:
-                return ExecutionResult(
-                    success=False,
-                    widget_type=self.widget_type,
-                    target_value=value,
-                    error="Fill step returned False"
-                )
+                fill_reason = f"[{self.widget_type} Executor] fill() returned False for value '{value}'"
+                # If fill failed, attempt fallback_fill immediately if available
+                if hasattr(self, 'fallback_fill'):
+                    print(f"{fill_reason}. Attempting fallback_fill...")
+                    try:
+                        await self.fallback_fill(ctx, element, value, **kwargs)
+                        await asyncio.sleep(0.2)
+                    except Exception as fb_err:
+                        fill_reason += f" (fallback_fill error: {fb_err})"
+                else:
+                    return ExecutionResult(
+                        success=False,
+                        widget_type=self.widget_type,
+                        target_value=value,
+                        error=fill_reason
+                    )
 
             # Brief pause for DOM / framework reactivity
             await asyncio.sleep(0.15)
@@ -153,27 +164,53 @@ class BaseWidgetExecutor:
             # 2. Verify step (Re-read actual DOM value)
             v_ok, read_val = await self.verify(ctx, element, value, **kwargs)
 
-            # 3. Fallback retry if verification failed
-            if not v_ok and hasattr(self, 'fallback_fill'):
+            # 3. Fallback retry if verification failed and fill_ok was True
+            if not v_ok and hasattr(self, 'fallback_fill') and fill_ok:
                 print(f"[{self.widget_type} Executor] Initial verify failed (read: '{read_val}', expected: '{value}'). Running fallback...")
-                await self.fallback_fill(ctx, element, value, **kwargs)
-                await asyncio.sleep(0.2)
-                v_ok, read_val = await self.verify(ctx, element, value, **kwargs)
+                try:
+                    await self.fallback_fill(ctx, element, value, **kwargs)
+                    await asyncio.sleep(0.2)
+                    v_ok, read_val = await self.verify(ctx, element, value, **kwargs)
+                except Exception as fb_err:
+                    print(f"[{self.widget_type} Executor] Fallback fill failed: {fb_err}")
+
+            if v_ok:
+                return ExecutionResult(
+                    success=True,
+                    widget_type=self.widget_type,
+                    target_value=value,
+                    verified_value=read_val,
+                    verification_passed=True,
+                    error=None
+                )
+
+            # If option selection / click succeeded (fill_ok == True) but the displayed value is genuinely unreadable:
+            # return a distinct "unverified" result with meta flag so the caller can flag for manual confirmation instead of looping.
+            is_unverified = False
+            if fill_ok and (read_val is None or read_val == "" or read_val.lower() in ["select", "choose", "select an option"]):
+                is_unverified = True
+
+            err_msg = f"Verification failed. Read: '{read_val}', Expected: '{value}'"
+            if is_unverified:
+                err_msg = f"Unverified: Option click succeeded for '{value}', but displayed value is unreadable in DOM."
+            elif fill_reason:
+                err_msg = f"{fill_reason} and {err_msg}"
 
             return ExecutionResult(
-                success=v_ok,
+                success=False,
                 widget_type=self.widget_type,
                 target_value=value,
                 verified_value=read_val,
-                verification_passed=v_ok,
-                error=None if v_ok else f"Verification failed. Read: '{read_val}', Expected: '{value}'"
+                verification_passed=False,
+                error=err_msg,
+                meta={"unverified": is_unverified}
             )
         except Exception as e:
             return ExecutionResult(
                 success=False,
                 widget_type=self.widget_type,
                 target_value=value,
-                error=str(e)
+                error=f"[{self.widget_type} Executor Exception] {str(e)}"
             )
 
 # =========================================================================
@@ -433,6 +470,53 @@ def match_option_candidate(
 
     return (best_item, best_txt)
 
+def display_matches(expected: Any, shown: Any) -> bool:
+    """
+    Checks if the displayed text matches the expected value.
+    Passes if:
+      1. Direct equality (case-insensitive) or match_option_candidate matches.
+      2. Or if the displayed tokens (minus placeholder tokens like 'select', 'choose', 'option')
+         are a non-empty subset of the expected tokens (e.g. '+91' passes against 'India +91').
+    """
+    if expected is None or shown is None:
+        return False
+    exp_str = str(expected).strip()
+    shown_str = str(shown).strip()
+    if not exp_str or not shown_str:
+        return False
+
+    if exp_str.lower() == shown_str.lower():
+        return True
+
+    # 1. match_option_candidate check
+    match = match_option_candidate(exp_str, [(shown_str, shown_str)])
+    if match:
+        return True
+
+    # 2. Token subset matching (ignoring 'select', 'choose', 'option', etc.)
+    ignore_tokens = {"select", "choose", "option", "an", "the", "please"}
+    
+    # Tokenize preserving dial-code plus if present
+    def extract_tokens(s: str) -> set:
+        # Extract dial codes with +
+        dials = set(re.findall(r'\+\d{1,4}', s))
+        words = {tok.lower() for tok in re.findall(r'\b\w+\b', s.lower()) if tok.lower() not in ignore_tokens}
+        return dials | words
+
+    shown_tokens = extract_tokens(shown_str)
+    exp_tokens = extract_tokens(exp_str)
+
+    if shown_tokens and shown_tokens.issubset(exp_tokens):
+        return True
+
+    # Check reversed dial-code / country containment (e.g. "+91" in "India +91")
+    shown_dials = re.findall(r'\+\d{1,4}', shown_str)
+    exp_dials = re.findall(r'\+\d{1,4}', exp_str)
+    if shown_dials and exp_dials and shown_dials[0] == exp_dials[0]:
+        return True
+
+    return False
+
 # =========================================================================
 # 2. NATIVE SELECT WIDGET EXECUTOR
 # =========================================================================
@@ -578,16 +662,14 @@ class CustomComboboxWidgetExecutor(BaseWidgetExecutor):
         input_el = await parent_container.query_selector("input") if parent_container else None
         trigger = control or input_el or element
 
-        # 1. Open popup
+        # 1. Open popup - single click to avoid double toggle closing the listbox
         try:
             await trigger.click(timeout=1500)
         except Exception:
             pass
-        if input_el and input_el != trigger:
-            try:
-                await input_el.click(timeout=1000)
-            except Exception:
-                pass
+
+        # Brief pause to let popup register in DOM
+        await asyncio.sleep(0.1)
 
         # 2. Locate listbox tied through aria-controls or aria-owns
         listbox = None
@@ -613,6 +695,25 @@ class CustomComboboxWidgetExecutor(BaseWidgetExecutor):
             listbox = await ctx.query_selector('.select__menu, [role="listbox"], .select2-results__options, [class*="MuiAutocomplete-popper"] [role="listbox"], [class*="MuiAutocomplete-listbox"]')
             if not listbox and hasattr(page, "query_selector"):
                 listbox = await page.query_selector('.select__menu, [role="listbox"], .select2-results__options, [class*="MuiAutocomplete-popper"] [role="listbox"], [class*="MuiAutocomplete-listbox"]')
+
+        # Check whether the listbox is open; only click input_el if listbox is still NOT open
+        is_open = False
+        if listbox:
+            try:
+                is_open = await listbox.is_visible()
+            except Exception:
+                is_open = False
+
+        if not is_open and input_el and input_el != trigger:
+            try:
+                await input_el.click(timeout=1000)
+                await asyncio.sleep(0.1)
+                if not listbox and listbox_id:
+                    listbox = await ctx.query_selector(f"#{listbox_id}")
+                if not listbox:
+                    listbox = await ctx.query_selector('.select__menu, [role="listbox"], .select2-results__options, [class*="MuiAutocomplete-popper"] [role="listbox"], [class*="MuiAutocomplete-listbox"]')
+            except Exception:
+                pass
 
         # 3. If searchable input exists, type to filter
         search_inp = await element.query_selector('input') or (element if await element.evaluate("e => e.tagName && e.tagName.toLowerCase() === 'input'") else None)
@@ -690,20 +791,23 @@ class CustomComboboxWidgetExecutor(BaseWidgetExecutor):
         )
 
         selected_text = await parent_container.evaluate("""container => {
-            // 1. Direct input value if container is an input with non-empty value
-            if (container.tagName && container.tagName.toLowerCase() === 'input') {
-                if (container.value && container.value.trim()) return container.value.trim();
-            }
+            // 1. .select__single-value
+            const s1 = container.querySelector('.select__single-value');
+            if (s1 && s1.innerText && s1.innerText.trim()) return s1.innerText.trim();
 
-            // 2. React-Select, Select2, MUI single-value or rendered text
-            const single = container.querySelector('.select__single-value, [class*="singleValue"], .select2-selection__rendered, [class*="selection__rendered"], [class*="MuiAutocomplete-tag"]');
-            if (single && single.innerText && single.innerText.trim()) return single.innerText.trim();
+            // 2. [class*="singleValue"]
+            const s2 = container.querySelector('[class*="singleValue"]');
+            if (s2 && s2.innerText && s2.innerText.trim()) return s2.innerText.trim();
 
-            // 3. Dedicated dial-code / country badge elements (intl-tel-input, react-phone-number-input, etc.)
-            const dialCodeEl = container.querySelector('.iti__selected-dial-code, .selected-dial-code, [class*="dial-code"], [class*="dialCode"], [class*="country-dial-code"]');
-            if (dialCodeEl && dialCodeEl.innerText && dialCodeEl.innerText.trim()) {
-                const dc = dialCodeEl.innerText.trim();
-                const flagParent = dialCodeEl.closest('[title], [aria-label]') || container.querySelector('[class*="selected-flag"][title], [class*="selected-flag"][aria-label]');
+            // 3. .select2-selection__rendered
+            const s3 = container.querySelector('.select2-selection__rendered, [class*="selection__rendered"]');
+            if (s3 && s3.innerText && s3.innerText.trim()) return s3.innerText.trim();
+
+            // 4. .iti__selected-dial-code
+            const s4 = container.querySelector('.iti__selected-dial-code');
+            if (s4 && s4.innerText && s4.innerText.trim()) {
+                const dc = s4.innerText.trim();
+                const flagParent = s4.closest('[title], [aria-label]') || container.querySelector('[class*="selected-flag"][title], [class*="selected-flag"][aria-label]');
                 const titleOrAria = flagParent ? (flagParent.getAttribute('title') || flagParent.getAttribute('aria-label') || '') : '';
                 if (titleOrAria && (titleOrAria.includes('+') || /[a-zA-Z]{3,}/.test(titleOrAria))) {
                     return `${titleOrAria} ${dc}`.trim();
@@ -711,47 +815,50 @@ class CustomComboboxWidgetExecutor(BaseWidgetExecutor):
                 return dc;
             }
 
-            // 4. aria-label or title attributes on container, buttons, flags, or comboboxes
-            const ariaCandidates = [
-                container.getAttribute('aria-label'),
-                container.getAttribute('title'),
-                ...Array.from(container.querySelectorAll('[class*="flag"][title], [class*="flag"][aria-label], [class*="selected"][title], [class*="selected"][aria-label], button[title], button[aria-label], [role="combobox"][aria-label], [role="combobox"][title]')).map(n => n.getAttribute('title') || n.getAttribute('aria-label'))
-            ].filter(Boolean);
-
-            for (const a of ariaCandidates) {
-                const aClean = a.trim();
-                if (aClean && (aClean.includes('+') || /\\b(india|united states|us|uk|canada|singapore|germany|france|australia)\\b/i.test(aClean))) {
-                    return aClean;
+            // 5. [class*="selected-dial-code"]
+            const s5 = container.querySelector('[class*="selected-dial-code"], [class*="dial-code"], [class*="dialCode"], [class*="country-dial-code"]');
+            if (s5 && s5.innerText && s5.innerText.trim()) {
+                const dc = s5.innerText.trim();
+                const flagParent = s5.closest('[title], [aria-label]') || container.querySelector('[class*="selected-flag"][title], [class*="selected-flag"][aria-label]');
+                const titleOrAria = flagParent ? (flagParent.getAttribute('title') || flagParent.getAttribute('aria-label') || '') : '';
+                if (titleOrAria && (titleOrAria.includes('+') || /[a-zA-Z]{3,}/.test(titleOrAria))) {
+                    return `${titleOrAria} ${dc}`.trim();
                 }
+                return dc;
             }
 
-            // 5. Hidden inputs holding country code or selected dial code
-            const hiddenInputs = Array.from(container.querySelectorAll('input[type="hidden"], input[name*="country" i], input[name*="dial" i], input[name*="phone_country" i]'));
+            // 6. Hidden input's value
+            const hiddenInputs = Array.from((container && container.querySelectorAll) ? container.querySelectorAll('input[type="hidden"], input[name*="country" i], input[name*="dial" i], input[name*="phone_country" i]') : []);
             for (const hInp of hiddenInputs) {
                 if (hInp.value && hInp.value.trim()) {
                     return hInp.value.trim();
                 }
             }
 
-            // 6. Visible inputs with value
+            // 7. Visible input's value
+            if (container.tagName && container.tagName.toLowerCase() === 'input') {
+                if (container.value && container.value.trim()) return container.value.trim();
+            }
             const inp = container.querySelector('input:not([type="hidden"])');
             if (inp && inp.value && inp.value.trim()) return inp.value.trim();
 
-            // 7. Button or Combobox text
-            const btn = container.querySelector('button, [role="button"], [role="combobox"]');
-            if (btn && btn.innerText && btn.innerText.trim()) {
-                const bTxt = btn.innerText.trim();
-                if (!['select', 'choose', 'open'].includes(bTxt.toLowerCase())) {
-                    return bTxt;
+            // 8. aria-label, title or text of button[aria-haspopup] or [role="combobox"]
+            const ariaControls = Array.from((container && container.querySelectorAll) ? container.querySelectorAll('button[aria-haspopup], [role="combobox"], [role="button"]') : []);
+            if (container.getAttribute('role') === 'combobox' || container.hasAttribute('aria-haspopup')) {
+                ariaControls.unshift(container);
+            }
+            for (const ac of ariaControls) {
+                const aria = (ac.getAttribute('aria-label') || ac.getAttribute('title') || '').trim();
+                if (aria && !['select', 'choose', 'open'].includes(aria.toLowerCase())) {
+                    return aria;
+                }
+                const acText = (ac.innerText || '').trim();
+                if (acText && !['select', 'choose', 'open', 'select an option'].includes(acText.toLowerCase())) {
+                    return acText;
                 }
             }
 
-            // 8. Container innerText if non-empty and not placeholder
-            const cText = (container.innerText || '').trim();
-            if (cText && !['select', 'select an option', 'choose'].includes(cText.toLowerCase())) {
-                return cText;
-            }
-
+            // Do NOT fall back to container.innerText, because that returns placeholders!
             return '';
         }""")
 
@@ -776,27 +883,8 @@ class CustomComboboxWidgetExecutor(BaseWidgetExecutor):
         if curr_clean.lower() in ["select", "select an option", "select...", "-- select --", "choose", ""]:
             return False, curr_clean
 
-        exp_clean = str(expected_value).strip()
-
-        # 1. Exact match
-        if curr_clean == exp_clean or curr_clean.lower() == exp_clean.lower():
-            return True, curr_clean
-
-        # 2. Country / Dial code equivalence (e.g. "+91" vs "India +91" or "India (+91)")
-        curr_dial = re.findall(r'\+\d{1,4}', curr_clean)
-        exp_dial = re.findall(r'\+\d{1,4}', exp_clean)
-        if curr_dial and exp_dial and curr_dial[0] == exp_dial[0]:
-            return True, curr_clean
-
-        # 3. Country / Location name substring containment (e.g. "India" in "India +91" or "United States" in "United States +1")
-        c_low = curr_clean.lower()
-        e_low = exp_clean.lower()
-        if (c_low in e_low or e_low in c_low) and len(c_low) >= 3 and c_low not in ["select", "choose", "option"]:
-            return True, curr_clean
-
-        # 4. Standard match_option_candidate
-        match = match_option_candidate(expected_value, [(curr_clean, curr_clean)])
-        if match:
+        # Check if display matches expected
+        if display_matches(expected_value, curr_clean):
             return True, curr_clean
 
         return False, curr_clean
