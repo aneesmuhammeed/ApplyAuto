@@ -174,7 +174,7 @@ class BaseWidgetExecutor:
             # 2. Verify step (Re-read actual DOM value)
             v_ok, read_val = await self.verify(ctx, element, value, **kwargs)
 
-            # 3. Fallback retry if verification failed and fill_ok was True
+            # 3. Fallback retry if verification failed and fallback_fill exists (and wasn't already run on fill failure)
             if not v_ok and hasattr(self, 'fallback_fill') and fill_ok:
                 print(f"[{self.widget_type} Executor] Initial verify failed (read: '{read_val}', expected: '{value}'). Running fallback...")
                 try:
@@ -390,7 +390,16 @@ def match_option_candidate(
     if is_target_yes:
         yes_matches = []
         for c in valid_cands:
-            c_tokens = set(re.findall(r'\b\w+\b', c[1].lower()))
+            c_low = c[1].strip().lower()
+            first_tok_m = re.match(r'^(yes|no)\b', c_low)
+            leading_tok = first_tok_m.group(1) if first_tok_m else None
+            if leading_tok == "yes":
+                yes_matches.append(c)
+                continue
+            if leading_tok == "no":
+                continue
+
+            c_tokens = set(re.findall(r'\b\w+\b', c_low))
             has_affirmative = bool(c_tokens & {"yes", "true", "y", "authorized", "eligible", "agree"})
             has_negative = bool(c_tokens & {"not", "no", "never", "unauthorized", "ineligible", "none"})
             if has_affirmative and not has_negative:
@@ -407,11 +416,21 @@ def match_option_candidate(
     if is_target_no:
         no_matches = []
         for c in valid_cands:
-            c_tokens = set(re.findall(r'\b\w+\b', c[1].lower()))
-            # Explicitly reject "not applicable" or "none"
+            c_low = c[1].strip().lower()
+            first_tok_m = re.match(r'^(yes|no)\b', c_low)
+            leading_tok = first_tok_m.group(1) if first_tok_m else None
+            # If the option begins with "No" (e.g. "No, none of the above"), accept it directly
+            if leading_tok == "no":
+                no_matches.append(c)
+                continue
+            if leading_tok == "yes":
+                continue
+
+            c_tokens = set(re.findall(r'\b\w+\b', c_low))
+            # Explicitly reject standalone "not applicable" or "none" when no leading "No"
             if c_tokens & {"applicable", "none"}:
                 continue
-            has_negative = bool(c_tokens & {"no", "false", "n", "never", "unauthorized", "ineligible", "disagree"}) or bool(re.match(r'^no\b', c[1].strip().lower()))
+            has_negative = bool(c_tokens & {"no", "false", "n", "never", "unauthorized", "ineligible", "disagree"})
             if has_negative:
                 no_matches.append(c)
         if no_matches:
@@ -710,10 +729,40 @@ class CustomComboboxWidgetExecutor(BaseWidgetExecutor):
                 listbox = None
 
         if not listbox:
-            # Fallback to standard combobox listbox containers (avoiding broad [class*="dropdown"] or generic li)
-            listbox = await ctx.query_selector('.select__menu, [role="listbox"], .select2-results__options, [class*="MuiAutocomplete-popper"] [role="listbox"], [class*="MuiAutocomplete-listbox"]')
-            if not listbox and hasattr(page, "query_selector"):
-                listbox = await page.query_selector('.select__menu, [role="listbox"], .select2-results__options, [class*="MuiAutocomplete-popper"] [role="listbox"], [class*="MuiAutocomplete-listbox"]')
+            # Fallback to standard combobox listbox containers nearest the trigger / element
+            # Prefer listbox within parent container first
+            listbox = await parent_container.query_selector('.select__menu, [role="listbox"], .select2-results__options, [class*="MuiAutocomplete-popper"] [role="listbox"], [class*="MuiAutocomplete-listbox"]') if parent_container else None
+
+            if not listbox:
+                # Query all candidates and pick the visible one nearest to the trigger element
+                candidates = await ctx.query_selector_all('.select__menu, [role="listbox"], .select2-results__options, [class*="MuiAutocomplete-popper"] [role="listbox"], [class*="MuiAutocomplete-listbox"]')
+                if not candidates and hasattr(page, "query_selector_all"):
+                    candidates = await page.query_selector_all('.select__menu, [role="listbox"], .select2-results__options, [class*="MuiAutocomplete-popper"] [role="listbox"], [class*="MuiAutocomplete-listbox"]')
+
+                if candidates:
+                    trig_box = None
+                    try:
+                        trig_box = await trigger.bounding_box()
+                    except Exception:
+                        trig_box = None
+
+                    visible_candidates = []
+                    for c in candidates:
+                        try:
+                            if await c.is_visible():
+                                c_box = await c.bounding_box()
+                                dist = 0.0
+                                if trig_box and c_box:
+                                    dist = abs(c_box['y'] - trig_box['y']) + abs(c_box['x'] - trig_box['x'])
+                                visible_candidates.append((dist, c))
+                        except Exception:
+                            pass
+
+                    if visible_candidates:
+                        visible_candidates.sort(key=lambda x: x[0])
+                        listbox = visible_candidates[0][1]
+                    elif candidates:
+                        listbox = candidates[0]
 
         # Check whether the listbox is open; only click input_el if listbox is still NOT open
         is_open = False
@@ -730,7 +779,13 @@ class CustomComboboxWidgetExecutor(BaseWidgetExecutor):
                 if not listbox and listbox_id:
                     listbox = await ctx.query_selector(f'[id="{listbox_id}"]')
                 if not listbox:
-                    listbox = await ctx.query_selector('.select__menu, [role="listbox"], .select2-results__options, [class*="MuiAutocomplete-popper"] [role="listbox"], [class*="MuiAutocomplete-listbox"]')
+                    listbox = await parent_container.query_selector('.select__menu, [role="listbox"], .select2-results__options, [class*="MuiAutocomplete-popper"] [role="listbox"], [class*="MuiAutocomplete-listbox"]') if parent_container else None
+                if not listbox:
+                    candidates = await ctx.query_selector_all('.select__menu, [role="listbox"], .select2-results__options, [class*="MuiAutocomplete-popper"] [role="listbox"], [class*="MuiAutocomplete-listbox"]')
+                    for c in candidates:
+                        if await c.is_visible():
+                            listbox = c
+                            break
             except Exception:
                 pass
 
@@ -793,7 +848,15 @@ class CustomComboboxWidgetExecutor(BaseWidgetExecutor):
                             await matched_opt.evaluate("el => el.click()")
                         return True
 
-        # Unverified Enter fallback removed! If no option matches, return False.
+        # When no option matches: clean up state by pressing Escape and clearing typed text
+        try:
+            if search_inp:
+                await search_inp.evaluate("el => { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }")
+            if hasattr(page, "keyboard"):
+                await page.keyboard.press("Escape")
+        except Exception:
+            pass
+
         return False
 
     async def verify(self, ctx: Union[Page, Frame], element: ElementHandle, expected_value: Any, **kwargs) -> Tuple[bool, Optional[str]]:
@@ -927,16 +990,38 @@ class CustomComboboxWidgetExecutor(BaseWidgetExecutor):
 class RadioWidgetExecutor(BaseWidgetExecutor):
     widget_type = WidgetType.RADIO
 
+    async def _get_group_radios(self, ctx: Union[Page, Frame], element: ElementHandle) -> List[ElementHandle]:
+        """
+        Locates all sibling radios in the group:
+        1. If radio has a non-empty `name`, query by properly escaped name selector.
+        2. Otherwise, group by the nearest fieldset, role=radiogroup, or radio-group container.
+        3. Fallback to [element].
+        """
+        name = await element.get_attribute("name") or ""
+        if name:
+            safe_name = name.replace('\\', '\\\\').replace('"', '\\"')
+            return await ctx.query_selector_all(f'input[type="radio"][name="{safe_name}"]')
+
+        # Radios without name attribute: group by nearest fieldset / role=radiogroup / container
+        container = await element.evaluate_handle("""el => {
+            return el.closest('fieldset, [role="radiogroup"], .radio-group, .form-group, .radio-group-container') || el.parentElement;
+        }""")
+        if container:
+            radios = await container.query_selector_all('input[type="radio"]')
+            if radios:
+                return radios
+
+        return [element]
+
     async def fill(self, ctx: Union[Page, Frame], element: ElementHandle, value: Any, **kwargs) -> bool:
         if value is None:
             return False
         target = str(value).strip()
         if not target:
             return False
-        name = await element.get_attribute("name") or ""
 
         # Find all sibling radios in the group
-        group_radios = await ctx.query_selector_all(f'input[type="radio"][name="{name}"]') if name else [element]
+        group_radios = await self._get_group_radios(ctx, element)
 
         candidates: List[Tuple[ElementHandle, str]] = []
         for r_el in group_radios:
@@ -973,8 +1058,7 @@ class RadioWidgetExecutor(BaseWidgetExecutor):
         target = str(value).strip()
         if not target:
             return
-        name = await element.get_attribute("name") or ""
-        group_radios = await ctx.query_selector_all(f'input[type="radio"][name="{name}"]') if name else [element]
+        group_radios = await self._get_group_radios(ctx, element)
 
         candidates: List[Tuple[ElementHandle, str]] = []
         for r_el in group_radios:
@@ -1003,8 +1087,7 @@ class RadioWidgetExecutor(BaseWidgetExecutor):
 
     async def verify(self, ctx: Union[Page, Frame], element: ElementHandle, expected_value: Any, **kwargs) -> Tuple[bool, Optional[str]]:
         """Re-reads whether the specific checked radio matches expected value."""
-        name = await element.get_attribute("name") or ""
-        group_radios = await ctx.query_selector_all(f'input[type="radio"][name="{name}"]') if name else [element]
+        group_radios = await self._get_group_radios(ctx, element)
         target = str(expected_value).strip()
 
         checked_radio = None
@@ -1467,11 +1550,21 @@ async def verify_filled_widgets(
         # Re-locate the element in DOM
         el = None
         if selector:
-            el = await ctx.query_selector(selector)
+            try:
+                el = await ctx.query_selector(selector)
+            except Exception:
+                el = None
         if not el and el_id:
-            el = await ctx.query_selector(f'[id="{el_id}"]')
+            try:
+                el = await ctx.query_selector(f'[id="{el_id}"]')
+            except Exception:
+                el = None
         if not el and name:
-            el = await ctx.query_selector(f'[name="{name}"]')
+            try:
+                safe_name = name.replace('\\', '\\\\').replace('"', '\\"')
+                el = await ctx.query_selector(f'[name="{safe_name}"]')
+            except Exception:
+                el = None
 
         if not el:
             # Cannot re-locate; record warning but don't hard fail if dynamic DOM changed

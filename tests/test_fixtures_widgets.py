@@ -323,5 +323,29 @@ class TestFixturesWidgets(unittest.IsolatedAsyncioTestCase):
         detected_text_type = await detect_widget_type(page, text_el)
         self.assertEqual(detected_text_type, WidgetType.TEXT, "Input in .selectable must detect as TEXT")
 
+        # 6. Two comboboxes on one page: listbox scoping test
+        p1_input = await page.wait_for_selector("#skill-primary-input")
+        res_p1 = await cb_exec.execute(page, p1_input, "Python")
+        self.assertTrue(res_p1.success, f"Filling primary combobox failed: {res_p1.error}")
+
+        p2_input = await page.wait_for_selector("#skill-secondary-input")
+        res_p2 = await cb_exec.execute(page, p2_input, "TypeScript")
+        self.assertTrue(res_p2.success, f"Filling secondary combobox failed: {res_p2.error}")
+
+        # 7. Date field with and without placeholder
+        date_exec = widget_registry.get_executor(WidgetType.DATE)
+        date_no_ph = await page.wait_for_selector("#date-no-placeholder")
+        res_date = await date_exec.execute(page, date_no_ph, "2025-06-15")
+        self.assertTrue(res_date.success, f"Filling date without placeholder failed: {res_date.error}")
+        self.assertEqual(await date_no_ph.input_value(), "2025-06-15")
+
+        # 8. match_option_candidate boolean leading token test
+        from widget_executors import match_option_candidate
+        opts = [(1, "Yes, absolutely"), (2, "No, none of the above"), (3, "Not applicable")]
+        m_no = match_option_candidate("no", opts)
+        self.assertIsNotNone(m_no)
+        self.assertEqual(m_no[0], 2, "Option 'No, none of the above' should match 'no'")
+        self.assertEqual(m_no[1], "No, none of the above")
+
 if __name__ == "__main__":
     unittest.main()

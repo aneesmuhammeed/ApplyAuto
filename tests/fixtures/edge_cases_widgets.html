@@ -50,6 +50,39 @@
       <label for="candidate-github">GitHub Profile</label>
       <input type="text" id="candidate-github" name="github_url" placeholder="https://github.com/..." />
     </div>
+
+    <!-- 5. Two comboboxes on one page (Listbox scoping test) -->
+    <div id="first-combobox-wrapper" class="form-group">
+      <label id="lbl-primary-skill">Primary Skill</label>
+      <div class="select__container" id="skill-primary-container">
+        <div class="select__control" id="skill-primary-control" role="combobox" aria-haspopup="listbox" aria-expanded="false">
+          <input id="skill-primary-input" class="select__input" type="text" autocomplete="off" />
+        </div>
+        <div role="listbox" class="select__menu" id="primary-skill-listbox" style="display: none;">
+          <div role="option" class="select__option">Python</div>
+          <div role="option" class="select__option">Go</div>
+        </div>
+      </div>
+    </div>
+
+    <div id="second-combobox-wrapper" class="form-group">
+      <label id="lbl-secondary-skill">Secondary Skill</label>
+      <div class="select__container" id="skill-secondary-container">
+        <div class="select__control" id="skill-secondary-control" role="combobox" aria-haspopup="listbox" aria-expanded="false">
+          <input id="skill-secondary-input" class="select__input" type="text" autocomplete="off" />
+        </div>
+        <div role="listbox" class="select__menu" id="secondary-skill-listbox" style="display: none;">
+          <div role="option" class="select__option">Rust</div>
+          <div role="option" class="select__option">TypeScript</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 6. Date field without placeholder (ISO fallback test) -->
+    <div class="form-group">
+      <label for="date-no-placeholder">Availability Date</label>
+      <input type="text" id="date-no-placeholder" name="availability_date" />
+    </div>
   </form>
 
   <script>
@@ -65,6 +98,18 @@
     const s2Menu = document.getElementById('country-listbox');
     s2Box.addEventListener('click', () => {
       s2Menu.style.display = s2Menu.style.display === 'none' ? 'block' : 'none';
+    });
+
+    const p1Ctrl = document.getElementById('skill-primary-control');
+    const p1Menu = document.getElementById('primary-skill-listbox');
+    p1Ctrl.addEventListener('click', () => {
+      p1Menu.style.display = p1Menu.style.display === 'none' ? 'block' : 'none';
+    });
+
+    const p2Ctrl = document.getElementById('skill-secondary-control');
+    const p2Menu = document.getElementById('secondary-skill-listbox');
+    p2Ctrl.addEventListener('click', () => {
+      p2Menu.style.display = p2Menu.style.display === 'none' ? 'block' : 'none';
     });
   </script>
 </body>
