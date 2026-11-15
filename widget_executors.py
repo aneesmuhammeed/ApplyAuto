@@ -367,6 +367,37 @@ def match_option_candidate(
                 return no_matches[0]
             return None  # Tie
 
+    # Stage 3.5: Dial-code / Country calling code and country name equivalence
+    t_dials = re.findall(r'\+\d{1,4}', target_str)
+    t_stripped = re.sub(r'[\+\(\)]?\b\d{1,4}\b', '', target_str).strip(' ()-,/')
+    if t_dials or (len(t_stripped) >= 3 and any(re.findall(r'\+\d{1,4}', c[1]) for c in valid_cands)):
+        t_dial = t_dials[0] if t_dials else None
+        dial_matches = []
+        for c in valid_cands:
+            c_dials = re.findall(r'\+\d{1,4}', c[1])
+            c_dial = c_dials[0] if c_dials else None
+            c_stripped = re.sub(r'[\+\(\)]?\b\d{1,4}\b', '', c[1]).strip(' ()-,/')
+
+            # 1. Matching dial codes (+91 vs India +91, +91 vs +91, India +91 vs +91)
+            if t_dial and (c_dial == t_dial or c[1].strip() == t_dial or c[1].strip() == t_dial.lstrip('+')):
+                dial_matches.append(c)
+            # 2. Matching country names when one has dial code and one does not
+            elif len(t_stripped) >= 3 and len(c_stripped) >= 3 and t_stripped.lower() == c_stripped.lower():
+                dial_matches.append(c)
+
+        if dial_matches:
+            if len(dial_matches) > 1 and len(t_stripped) >= 3:
+                # Disambiguate shared dial codes (e.g. +1 for US/Canada) via country name
+                named_matches = [
+                    c for c in dial_matches
+                    if t_stripped.lower() in c[1].lower() or c[1].lower() in t_stripped.lower()
+                ]
+                if len(named_matches) == 1:
+                    return named_matches[0]
+            distinct_texts = {c[1].strip().lower() for c in dial_matches}
+            if len(distinct_texts) == 1:
+                return dial_matches[0]
+
     # Stage 4: Token-based fuzzy matching with score threshold and tie rejection
     if not t_tokens_set:
         return None
@@ -654,27 +685,90 @@ class CustomComboboxWidgetExecutor(BaseWidgetExecutor):
                 if (el.classList && (el.classList.contains('select__control') || el.classList.contains('select__container') || el.classList.contains('select2-container'))) {
                     return el;
                 }
-                const ctrl = el.closest('.select__control, .select2-container, [class*="MuiAutocomplete-root"], [class*="ant-select"], .select__container, .select-shell');
+                const ctrl = el.closest('.select__control, .select2-container, [class*="MuiAutocomplete-root"], [class*="ant-select"], .select__container, .select-shell, .iti, [class*="phone-input"], [class*="phoneInput"], [class*="iti"], fieldset, .field, [class*="field"]');
                 if (ctrl) return ctrl;
                 return el.parentElement || el;
             }"""
         )
 
         selected_text = await parent_container.evaluate("""container => {
+            // 1. Direct input value if container is an input with non-empty value
             if (container.tagName && container.tagName.toLowerCase() === 'input') {
-                return container.value ? container.value.trim() : '';
+                if (container.value && container.value.trim()) return container.value.trim();
             }
+
+            // 2. React-Select, Select2, MUI single-value or rendered text
             const single = container.querySelector('.select__single-value, [class*="singleValue"], .select2-selection__rendered, [class*="selection__rendered"], [class*="MuiAutocomplete-tag"]');
-            if (single && single.innerText.trim()) return single.innerText.trim();
-            const inp = container.querySelector('input');
+            if (single && single.innerText && single.innerText.trim()) return single.innerText.trim();
+
+            // 3. Dedicated dial-code / country badge elements (intl-tel-input, react-phone-number-input, etc.)
+            const dialCodeEl = container.querySelector('.iti__selected-dial-code, .selected-dial-code, [class*="dial-code"], [class*="dialCode"], [class*="country-dial-code"]');
+            if (dialCodeEl && dialCodeEl.innerText && dialCodeEl.innerText.trim()) {
+                const dc = dialCodeEl.innerText.trim();
+                const flagParent = dialCodeEl.closest('[title], [aria-label]') || container.querySelector('[class*="selected-flag"][title], [class*="selected-flag"][aria-label]');
+                const titleOrAria = flagParent ? (flagParent.getAttribute('title') || flagParent.getAttribute('aria-label') || '') : '';
+                if (titleOrAria && (titleOrAria.includes('+') || /[a-zA-Z]{3,}/.test(titleOrAria))) {
+                    return `${titleOrAria} ${dc}`.trim();
+                }
+                return dc;
+            }
+
+            // 4. aria-label or title attributes on container, buttons, flags, or comboboxes
+            const ariaCandidates = [
+                container.getAttribute('aria-label'),
+                container.getAttribute('title'),
+                ...Array.from(container.querySelectorAll('[class*="flag"][title], [class*="flag"][aria-label], [class*="selected"][title], [class*="selected"][aria-label], button[title], button[aria-label], [role="combobox"][aria-label], [role="combobox"][title]')).map(n => n.getAttribute('title') || n.getAttribute('aria-label'))
+            ].filter(Boolean);
+
+            for (const a of ariaCandidates) {
+                const aClean = a.trim();
+                if (aClean && (aClean.includes('+') || /\\b(india|united states|us|uk|canada|singapore|germany|france|australia)\\b/i.test(aClean))) {
+                    return aClean;
+                }
+            }
+
+            // 5. Hidden inputs holding country code or selected dial code
+            const hiddenInputs = Array.from(container.querySelectorAll('input[type="hidden"], input[name*="country" i], input[name*="dial" i], input[name*="phone_country" i]'));
+            for (const hInp of hiddenInputs) {
+                if (hInp.value && hInp.value.trim()) {
+                    return hInp.value.trim();
+                }
+            }
+
+            // 6. Visible inputs with value
+            const inp = container.querySelector('input:not([type="hidden"])');
             if (inp && inp.value && inp.value.trim()) return inp.value.trim();
-            return container.innerText.trim();
+
+            // 7. Button or Combobox text
+            const btn = container.querySelector('button, [role="button"], [role="combobox"]');
+            if (btn && btn.innerText && btn.innerText.trim()) {
+                const bTxt = btn.innerText.trim();
+                if (!['select', 'choose', 'open'].includes(bTxt.toLowerCase())) {
+                    return bTxt;
+                }
+            }
+
+            // 8. Container innerText if non-empty and not placeholder
+            const cText = (container.innerText || '').trim();
+            if (cText && !['select', 'select an option', 'choose'].includes(cText.toLowerCase())) {
+                return cText;
+            }
+
+            return '';
         }""")
 
         curr_clean = (selected_text or "").strip()
         if not curr_clean:
             try:
                 curr_clean = (await element.input_value() or "").strip()
+            except Exception:
+                pass
+
+        if not curr_clean:
+            try:
+                curr_clean = await element.evaluate("""el => {
+                    return (el.value || el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+                }""")
             except Exception:
                 pass
 

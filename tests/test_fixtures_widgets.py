@@ -229,5 +229,56 @@ class TestFixturesWidgets(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(val_lname, "Anees K")
         self.assertEqual(val_email, "muhammedanees.mec@gmail.com")
 
+    # =========================================================================
+    # 9. Dial Code Combobox & Country Equivalence Verification
+    # =========================================================================
+    async def test_dial_code_matching_and_verification(self):
+        from widget_executors import match_option_candidate
+
+        # 1. Pure matching logic
+        # A. Target "India +91" vs Candidate "+91" (previously scored 0.57 < 0.75)
+        m1 = match_option_candidate("India +91", [("opt1", "+91")])
+        self.assertIsNotNone(m1)
+        self.assertEqual(m1[1], "+91")
+
+        # B. Target "+91" vs Candidate "India +91"
+        m2 = match_option_candidate("+91", [("opt2", "India +91")])
+        self.assertIsNotNone(m2)
+        self.assertEqual(m2[1], "India +91")
+
+        # C. Target "India +91" vs Candidate "India"
+        m3 = match_option_candidate("India +91", [("opt3", "India")])
+        self.assertIsNotNone(m3)
+        self.assertEqual(m3[1], "India")
+
+        # D. Disambiguate shared dial code (+1)
+        m4 = match_option_candidate("United States +1", [("ca", "Canada (+1)"), ("us", "United States (+1)")])
+        self.assertIsNotNone(m4)
+        self.assertEqual(m4[0], "us")
+
+        # 2. Live DOM verification
+        page = await self.context.new_page()
+        await page.goto(get_fixture_url("dial_code_combobox.html"))
+
+        cb_exec = widget_registry.get_executor(WidgetType.CUSTOM_COMBOBOX)
+
+        # React-Select style dial code
+        react_el = await page.wait_for_selector("#country-code")
+        v_ok, read_val = await cb_exec.verify(page, react_el, "India +91")
+        self.assertTrue(v_ok)
+        self.assertIn("India", read_val)
+
+        # intl-tel-input style dial code
+        iti_flag = await page.wait_for_selector(".iti__selected-flag")
+        v_ok_iti, read_val_iti = await cb_exec.verify(page, iti_flag, "India +91")
+        self.assertTrue(v_ok_iti)
+        self.assertIn("+91", read_val_iti)
+
+        # Hidden input backed picker
+        picker_btn = await page.wait_for_selector("#hidden-backed-wrapper button")
+        v_ok_p, read_val_p = await cb_exec.verify(page, picker_btn, "India +91")
+        self.assertTrue(v_ok_p)
+        self.assertEqual(read_val_p, "India")
+
 if __name__ == "__main__":
     unittest.main()

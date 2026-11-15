@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Dial Code Combobox Fixture</title>
+  <style>
+    .field { margin: 15px 0; }
+    .select__control { border: 1px solid #ccc; padding: 5px; display: flex; align-items: center; }
+    .iti__selected-dial-code { font-weight: bold; }
+  </style>
+</head>
+<body>
+  <form id="test-form">
+    <!-- 1. React-Select style dial code control -->
+    <div class="field" id="react-select-wrapper">
+      <label for="country-code">Country</label>
+      <div class="select__container">
+        <div class="select__control">
+          <div class="select__single-value">India (+91)</div>
+          <div class="select__input-container">
+            <input id="country-code" class="select__input" role="combobox" value="" />
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 2. intl-tel-input style dial code container -->
+    <div class="field phone-input" id="iti-wrapper">
+      <label for="phone-input">Phone Number</label>
+      <div class="iti iti--allow-dropdown">
+        <div class="iti__flag-container">
+          <div class="iti__selected-flag" role="combobox" title="India: +91" aria-label="India: +91">
+            <div class="iti__selected-dial-code">+91</div>
+          </div>
+        </div>
+        <input type="tel" id="phone-input" name="phone" value="9876543210" />
+      </div>
+    </div>
+
+    <!-- 3. Hidden input backed country picker -->
+    <div class="field" id="hidden-backed-wrapper">
+      <label for="country-picker">Nationality</label>
+      <div class="custom-picker">
+        <input type="hidden" name="country_code" value="India" />
+        <button type="button" role="combobox" aria-label="India">India</button>
+      </div>
+    </div>
+  </form>
+</body>
+</html>
