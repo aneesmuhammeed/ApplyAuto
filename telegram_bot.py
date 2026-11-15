@@ -3,6 +3,7 @@ import re
 import json
 import urllib.request
 import urllib.parse
+import urllib.error
 from typing import List, Dict, Any, Optional, Tuple
 
 def sanitize_log(msg: str) -> str:
@@ -12,26 +13,79 @@ def sanitize_log(msg: str) -> str:
     cleaned = re.sub(r'\/bot[^\/]+\/', '/bot[REDACTED_TOKEN]/', cleaned)
     return cleaned
 
+def strip_quotes_and_whitespace(val: Any) -> str:
+    """Strip any surrounding whitespace, quotes, or trailing comments from env value."""
+    if val is None:
+        return ""
+    s = str(val).strip()
+    while s and (s[0] in ('"', "'", ' ', '\t') or s[-1] in ('"', "'", ' ', '\t', '\r', '\n')):
+        s = s.strip().strip('"').strip("'").strip()
+    return s
+
+def is_valid_telegram_token(token: Optional[str]) -> bool:
+    """Check if token matches real Telegram bot token format and is not a placeholder."""
+    if not token:
+        return False
+    t = strip_quotes_and_whitespace(token)
+    if any(placeholder in t.lower() for placeholder in ["your_", "placeholder", "token_here", "example", "none", "fake", "test", "<", ">", "changeme", "xxx"]):
+        return False
+    if t.startswith("bot") and ":" in t:
+        t = t[3:]
+    return bool(re.match(r'^\d{6,14}:[A-Za-z0-9_\-]{25,55}$', t))
+
+def is_valid_telegram_chat_id(chat_id: Optional[str]) -> bool:
+    """Check if chat_id matches real Telegram chat ID format (integer or @channel) and is not a placeholder."""
+    if not chat_id:
+        return False
+    c = strip_quotes_and_whitespace(chat_id)
+    if any(placeholder in c.lower() for placeholder in ["your_", "placeholder", "chat_id_here", "example", "none", "fake", "test", "<", ">", "changeme", "xxx"]):
+        return False
+    return bool(re.match(r'^-?\d{4,16}$|^@[A-Za-z0-9_]{4,32}$', c))
+
+def clean_telegram_token(token: Optional[str]) -> Optional[str]:
+    """Sanitize and validate Telegram bot token."""
+    if not token:
+        return None
+    t = strip_quotes_and_whitespace(token)
+    if t.startswith("bot") and ":" in t:
+        t = t[3:]
+    return t if is_valid_telegram_token(t) else None
+
+def clean_telegram_chat_id(chat_id: Optional[str]) -> Optional[str]:
+    """Sanitize and validate Telegram chat ID."""
+    if not chat_id:
+        return None
+    c = strip_quotes_and_whitespace(chat_id)
+    return c if is_valid_telegram_chat_id(c) else None
+
 def get_telegram_config() -> Tuple[Optional[str], Optional[str]]:
     """
-    Securely load Telegram bot token and chat ID.
+    Securely load and validate Telegram bot token and chat ID.
+    Strips stray quotes, whitespace, or accidental 'bot' prefixes.
+    Rejects placeholders (e.g. from .env.example) so invalid credentials
+    never trigger 404 Not Found network errors.
     Never prints or logs the token or chat ID.
     """
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
+    raw_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    raw_chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+
+    if not raw_token or not raw_chat_id:
         env_path = os.path.join(os.path.dirname(__file__), ".env")
         if os.path.exists(env_path):
             try:
                 with open(env_path, "r", encoding="utf-8") as f:
                     for line in f:
                         line = line.strip()
-                        if line.startswith("TELEGRAM_BOT_TOKEN=") and not token:
-                            token = line.split("=", 1)[1].strip().strip('"').strip("'")
-                        elif line.startswith("TELEGRAM_CHAT_ID=") and not chat_id:
-                            chat_id = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        if line.startswith("TELEGRAM_BOT_TOKEN=") and not raw_token:
+                            raw_token = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        elif line.startswith("TELEGRAM_CHAT_ID=") and not raw_chat_id:
+                            raw_chat_id = line.split("=", 1)[1].strip().strip('"').strip("'")
             except Exception:
                 pass
+
+    token = clean_telegram_token(raw_token)
+    chat_id = clean_telegram_chat_id(raw_chat_id)
+
     return token, chat_id
 
 def send_batch_questions_to_telegram(
@@ -46,8 +100,7 @@ def send_batch_questions_to_telegram(
     """
     token, chat_id = get_telegram_config()
     if not token or not chat_id:
-        # Generic message without revealing paths or credential names
-        print("[Telegram] Bot token or chat ID is not configured. Notification skipped.")
+        print("[Telegram] Bot token or chat ID is not configured (or is a placeholder). Notification skipped.")
         return False
 
     if not questions:
@@ -105,6 +158,23 @@ def send_batch_questions_to_telegram(
             if resp.status == 200:
                 print(f"[Telegram] Batch notification for {len(questions)} questions dispatched successfully.")
                 return True
+    except urllib.error.HTTPError as http_err:
+        err_desc = ""
+        try:
+            err_body = http_err.read().decode("utf-8")
+            err_json = json.loads(err_body)
+            err_desc = err_json.get("description", "")
+        except Exception:
+            err_desc = str(http_err)
+
+        if http_err.code == 404:
+            print("[Telegram] Bot token not found on Telegram API (HTTP 404). Verify your TELEGRAM_BOT_TOKEN.")
+        elif http_err.code == 401:
+            print("[Telegram] Unauthorized (HTTP 401). Verify your TELEGRAM_BOT_TOKEN.")
+        elif http_err.code == 400:
+            print(f"[Telegram] Bad Request (HTTP 400): {err_desc}. Check TELEGRAM_CHAT_ID.")
+        else:
+            print(f"[Telegram] HTTP Error {http_err.code}: {err_desc}")
     except Exception as e:
         safe_err = sanitize_log(str(e))
         print(f"[Telegram] Failed to dispatch message: {safe_err}")
