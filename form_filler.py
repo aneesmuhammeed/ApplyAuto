@@ -81,10 +81,17 @@ async def detect_login_wall(page: Page) -> Optional[str]:
         for el in login_headings:
             if await el.is_visible():
                 txt = (await el.inner_text() or "").lower()
-                if any(w in txt for w in ["sign in to apply", "log in to your account", "candidate sign in", "create an account to apply", "please log in to continue"]):
+                if any(w in txt for w in ["sign in to apply", "log in to your account", "candidate sign in", "create an account to apply", "please log in to continue", "please log in", "log in", "sign in"]):
                     pw = await page.query_selector('input[type="password"]')
                     if pw and await pw.is_visible():
                         return "Candidate Login Required. Please sign in on the open browser window, then click Resume."
+
+        # Check for password input alongside submit login/sign-in button
+        pw = await page.query_selector('input[type="password"]')
+        if pw and await pw.is_visible():
+            submit_btn = await page.query_selector('input[type="submit"][value*="Log In" i], input[type="submit"][value*="Sign In" i], button:has-text("Log In"), button:has-text("Sign In")')
+            if submit_btn and await submit_btn.is_visible():
+                return "Candidate Login Required. Please sign in on the open browser window, then click Resume."
     except Exception:
         pass
 

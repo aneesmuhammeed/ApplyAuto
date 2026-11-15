@@ -537,8 +537,11 @@ class CustomComboboxWidgetExecutor(BaseWidgetExecutor):
         # Find trigger control (React-Select, Select2, or ARIA combobox)
         parent_container = await element.evaluate_handle(
             """el => {
-                const outer = el.closest('.select__container, .select, [class*="select"], .select2-container, [class*="MuiAutocomplete-root"], [role="combobox"]');
-                if (outer && outer !== el) return outer;
+                if (el.classList && (el.classList.contains('select__control') || el.classList.contains('select__container') || el.classList.contains('select2-container'))) {
+                    return el;
+                }
+                const ctrl = el.closest('.select__control, .select2-container, [class*="MuiAutocomplete-root"], [class*="ant-select"], .select__container, .select-shell');
+                if (ctrl) return ctrl;
                 return el.parentElement || el;
             }"""
         )
@@ -648,8 +651,11 @@ class CustomComboboxWidgetExecutor(BaseWidgetExecutor):
         """Re-reads the currently displayed text inside the custom combobox."""
         parent_container = await element.evaluate_handle(
             """el => {
-                const outer = el.closest('.select__container, .select, [class*="select"], .select2-container, [class*="MuiAutocomplete-root"], [role="combobox"]');
-                if (outer && outer !== el) return outer;
+                if (el.classList && (el.classList.contains('select__control') || el.classList.contains('select__container') || el.classList.contains('select2-container'))) {
+                    return el;
+                }
+                const ctrl = el.closest('.select__control, .select2-container, [class*="MuiAutocomplete-root"], [class*="ant-select"], .select__container, .select-shell');
+                if (ctrl) return ctrl;
                 return el.parentElement || el;
             }"""
         )
@@ -678,6 +684,25 @@ class CustomComboboxWidgetExecutor(BaseWidgetExecutor):
         if curr_clean.lower() in ["select", "select an option", "select...", "-- select --", "choose", ""]:
             return False, curr_clean
 
+        exp_clean = str(expected_value).strip()
+
+        # 1. Exact match
+        if curr_clean == exp_clean or curr_clean.lower() == exp_clean.lower():
+            return True, curr_clean
+
+        # 2. Country / Dial code equivalence (e.g. "+91" vs "India +91" or "India (+91)")
+        curr_dial = re.findall(r'\+\d{1,4}', curr_clean)
+        exp_dial = re.findall(r'\+\d{1,4}', exp_clean)
+        if curr_dial and exp_dial and curr_dial[0] == exp_dial[0]:
+            return True, curr_clean
+
+        # 3. Country / Location name substring containment (e.g. "India" in "India +91" or "United States" in "United States +1")
+        c_low = curr_clean.lower()
+        e_low = exp_clean.lower()
+        if (c_low in e_low or e_low in c_low) and len(c_low) >= 3 and c_low not in ["select", "choose", "option"]:
+            return True, curr_clean
+
+        # 4. Standard match_option_candidate
         match = match_option_candidate(expected_value, [(curr_clean, curr_clean)])
         if match:
             return True, curr_clean

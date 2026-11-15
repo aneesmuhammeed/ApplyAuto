@@ -380,19 +380,64 @@ class ApplyMateWorker:
                                 print(f"[Worker] Failed to save answer to memory: {save_err}")
                 else:
                     err_msg = exec_res.error or "Verification check failed after fill"
-                    await self.log_app(app_id, f"[Verification Failed] Value check failed for '{ans_lbl}': {err_msg}. Retaining in batch.")
+                    attempts = ans_item.get("attempts", 0) + 1
+                    ans_item["attempts"] = attempts
+                    ans_item["last_error"] = err_msg
+                    ans_item["verification_failed"] = True
+                    await self.log_app(app_id, f"[Verification Failed] (Attempt {attempts}/3) Value check failed for '{ans_lbl}': {err_msg}.")
                     remaining_batch.append(ans_item)
 
-            update_application(app_id, {
-                "status": "processing" if not remaining_batch else "needs_input",
-                "batch_answers": remaining_batch,
-                "user_answer": None,
-                "unanswered_question": remaining_batch[0] if remaining_batch else None,
-                "unanswered_questions": remaining_batch,
-                "form_data": persisted_form_data
-            })
             saved_answers = get_saved_answers()
             await self.log_app(app_id, f"Applied & verified {applied_count}/{len(batch_answers)} batch answers.")
+
+            # If any answer failed verification or could not be applied:
+            if remaining_batch:
+                # Check for max retry exhaustion (backoff / circuit breaker)
+                exhausted = [item for item in remaining_batch if item.get("attempts", 0) >= 3]
+                screenshot = await self.capture_screenshot(page)
+                if exhausted:
+                    ex_lbl = exhausted[0].get("label") or "Question"
+                    ex_err = exhausted[0].get("last_error") or "Verification failed"
+                    pause_msg = f"Paused: 3 failed attempts to verify '{ex_lbl}' ({ex_err}). Please check the browser on your laptop."
+                    await self.log_app(app_id, f"[Circuit Breaker] {pause_msg}")
+                    update_application(app_id, {
+                        "status": "paused",
+                        "batch_answers": [],
+                        "user_answer": None,
+                        "unanswered_questions": remaining_batch,
+                        "unanswered_question": remaining_batch[0],
+                        "stage_message": pause_msg,
+                        "review_screenshot_url": screenshot,
+                        "form_data": persisted_form_data
+                    })
+                    return
+
+                # Under retry threshold: retain failed items in unanswered_questions,
+                # but CRITICALLY CLEAR batch_answers so the worker loop does NOT endless-loop!
+                first_rem = remaining_batch[0]
+                stage_msg = f"Verification failed for '{first_rem.get('label')}'. Please review or provide answer."
+                update_application(app_id, {
+                    "status": "needs_input",
+                    "batch_answers": [],  # Clear batch_answers to break the loop until new user input
+                    "user_answer": None,
+                    "unanswered_questions": remaining_batch,
+                    "unanswered_question": first_rem,
+                    "stage_message": stage_msg,
+                    "review_screenshot_url": screenshot,
+                    "form_data": persisted_form_data
+                })
+                # DO NOT proceed to fill_form_on_page while pending batch answers are unresolved!
+                return
+
+            # All batch answers were successfully applied and verified in the DOM!
+            update_application(app_id, {
+                "status": "processing",
+                "batch_answers": [],
+                "user_answer": None,
+                "unanswered_question": None,
+                "unanswered_questions": [],
+                "form_data": persisted_form_data
+            })
 
         # Execute autofill pass: scans form, uses local Qwen AI for understanding and answer generation
         await self.log_app(app_id, "Scanning form fields and utilizing local Qwen AI for intelligent autofill...")
