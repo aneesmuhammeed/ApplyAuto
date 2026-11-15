@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -17,10 +18,18 @@ from telegram_bot import (
     clean_telegram_token,
     clean_telegram_chat_id,
     send_batch_questions_to_telegram,
-    verify_and_process_telegram_reply
+    verify_and_process_telegram_reply,
+    telegram_enabled,
+    reset_telegram_verification
 )
 
 class TestTelegramBotHardening(unittest.TestCase):
+
+    def setUp(self):
+        reset_telegram_verification()
+
+    def tearDown(self):
+        reset_telegram_verification()
 
     def test_placeholder_detection(self):
         """Placeholders from .env.example or rotated template should be rejected."""
@@ -86,10 +95,18 @@ class TestTelegramBotHardening(unittest.TestCase):
     })
     def test_successful_dispatch_with_valid_credentials(self, mock_urlopen):
         """With valid credentials, Request is created with properly formed URL."""
-        mock_resp = MagicMock()
-        mock_resp.status = 200
-        mock_resp.__enter__.return_value = mock_resp
-        mock_urlopen.return_value = mock_resp
+        # First call is getMe in telegram_enabled(), second call is sendMessage
+        mock_get_me = MagicMock()
+        mock_get_me.status = 200
+        mock_get_me.read.return_value = b'{"ok": true, "result": {"username": "ApplyMateBot"}}'
+        mock_get_me.__enter__.return_value = mock_get_me
+
+        mock_send_msg = MagicMock()
+        mock_send_msg.status = 200
+        mock_send_msg.read.return_value = b'{"ok": true}'
+        mock_send_msg.__enter__.return_value = mock_send_msg
+
+        mock_urlopen.side_effect = [mock_get_me, mock_send_msg]
 
         dispatched = send_batch_questions_to_telegram(
             company_name="Stripe",
@@ -98,9 +115,30 @@ class TestTelegramBotHardening(unittest.TestCase):
             app_id="app-123"
         )
         self.assertTrue(dispatched)
-        mock_urlopen.assert_called_once()
-        req = mock_urlopen.call_args[0][0]
-        self.assertEqual(req.full_url, "https://api.telegram.org/bot123456789:ABCdefGHIjklMNOpqrsTUVwxyz_123456/sendMessage")
+        self.assertEqual(mock_urlopen.call_count, 2)
+        get_me_req = mock_urlopen.call_args_list[0][0][0]
+        self.assertEqual(get_me_req.full_url, "https://api.telegram.org/bot123456789:ABCdefGHIjklMNOpqrsTUVwxyz_123456/getMe")
+        send_req = mock_urlopen.call_args_list[1][0][0]
+        self.assertEqual(send_req.full_url, "https://api.telegram.org/bot123456789:ABCdefGHIjklMNOpqrsTUVwxyz_123456/sendMessage")
+
+    @patch("urllib.request.urlopen")
+    @patch.dict(os.environ, {
+        "TELEGRAM_BOT_TOKEN": "123456789:ABCdefGHIjklMNOpqrsTUVwxyz_123456",
+        "TELEGRAM_CHAT_ID": "987654321"
+    })
+    def test_telegram_enabled_checks_get_me_once_and_handles_404(self, mock_urlopen):
+        """telegram_enabled verifies via getMe once. HTTP 404 disables it and prevents repeated calls."""
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            url="https://api.telegram.org/bot.../getMe",
+            code=404,
+            msg="Not Found",
+            hdrs={},
+            fp=None
+        )
+        self.assertFalse(telegram_enabled())
+        # Subsequent calls should return cached False without calling urlopen again
+        self.assertFalse(telegram_enabled())
+        self.assertEqual(mock_urlopen.call_count, 1)
 
 if __name__ == "__main__":
     unittest.main()

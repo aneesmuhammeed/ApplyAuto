@@ -6,6 +6,10 @@ import urllib.parse
 import urllib.error
 from typing import List, Dict, Any, Optional, Tuple
 
+# Cached verified state: None = unverified, True = enabled & verified, False = disabled/invalid
+_TELEGRAM_ENABLED: Optional[bool] = None
+_TELEGRAM_CHECKED_ONCE: bool = False
+
 def sanitize_log(msg: str) -> str:
     """Strip any Telegram bot tokens or credentials from log strings."""
     # Redact /bot<token>/ and bot tokens of format \d+:[A-Za-z0-9_-]+
@@ -27,7 +31,9 @@ def is_valid_telegram_token(token: Optional[str]) -> bool:
     if not token:
         return False
     t = strip_quotes_and_whitespace(token)
-    if any(placeholder in t.lower() for placeholder in ["your_", "placeholder", "token_here", "example", "none", "fake", "test", "<", ">", "changeme", "xxx"]):
+    if not t or ":" not in t:
+        return False
+    if any(placeholder in t.lower() for placeholder in ["your_bot_token_here", "your_", "placeholder", "token_here", "example", "none", "fake", "test", "<", ">", "changeme", "xxx"]):
         return False
     if t.startswith("bot") and ":" in t:
         t = t[3:]
@@ -38,7 +44,9 @@ def is_valid_telegram_chat_id(chat_id: Optional[str]) -> bool:
     if not chat_id:
         return False
     c = strip_quotes_and_whitespace(chat_id)
-    if any(placeholder in c.lower() for placeholder in ["your_", "placeholder", "chat_id_here", "example", "none", "fake", "test", "<", ">", "changeme", "xxx"]):
+    if not c:
+        return False
+    if any(placeholder in c.lower() for placeholder in ["your_chat_id_here", "your_", "placeholder", "chat_id_here", "example", "none", "fake", "test", "<", ">", "changeme", "xxx"]):
         return False
     return bool(re.match(r'^-?\d{4,16}$|^@[A-Za-z0-9_]{4,32}$', c))
 
@@ -88,6 +96,59 @@ def get_telegram_config() -> Tuple[Optional[str], Optional[str]]:
 
     return token, chat_id
 
+def telegram_enabled() -> bool:
+    """
+    Checks if Telegram integration is configured and enabled.
+    Verifies the token ONCE at startup via getMe.
+    If disabled or invalid, logs ONE clear warning and skips all sends.
+    Never retries a 404 in a loop.
+    """
+    global _TELEGRAM_ENABLED, _TELEGRAM_CHECKED_ONCE
+
+    if _TELEGRAM_CHECKED_ONCE:
+        return bool(_TELEGRAM_ENABLED)
+
+    _TELEGRAM_CHECKED_ONCE = True
+    token, chat_id = get_telegram_config()
+
+    if not token or not chat_id:
+        _TELEGRAM_ENABLED = False
+        print("[Telegram Warning] Telegram integration is disabled: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing or placeholder.")
+        return False
+
+    # Verify token once via getMe
+    try:
+        url = f"https://api.telegram.org/bot{token}/getMe"
+        req = urllib.request.Request(url, headers={"User-Agent": "ApplyMate/1.0"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            if resp.status == 200:
+                body = resp.read().decode("utf-8")
+                data = json.loads(body)
+                if data.get("ok"):
+                    bot_name = data.get("result", {}).get("username", "Bot")
+                    print(f"[Telegram] Connected and verified successfully as @{bot_name}.")
+                    _TELEGRAM_ENABLED = True
+                    return True
+    except urllib.error.HTTPError as http_err:
+        if http_err.code == 404:
+            print("[Telegram Warning] TELEGRAM_BOT_TOKEN is invalid (HTTP 404 Not Found from getMe). Telegram notifications are disabled.")
+        elif http_err.code == 401:
+            print("[Telegram Warning] TELEGRAM_BOT_TOKEN is unauthorized (HTTP 401). Telegram notifications are disabled.")
+        else:
+            print(f"[Telegram Warning] getMe failed with HTTP {http_err.code}. Telegram notifications are disabled.")
+    except Exception as e:
+        safe_e = sanitize_log(str(e))
+        print(f"[Telegram Warning] Could not verify Telegram bot token ({safe_e}). Telegram notifications are disabled.")
+
+    _TELEGRAM_ENABLED = False
+    return False
+
+def reset_telegram_verification():
+    """Reset verification cache for testing."""
+    global _TELEGRAM_ENABLED, _TELEGRAM_CHECKED_ONCE
+    _TELEGRAM_ENABLED = None
+    _TELEGRAM_CHECKED_ONCE = False
+
 def send_batch_questions_to_telegram(
     company_name: str,
     job_title: str,
@@ -98,9 +159,11 @@ def send_batch_questions_to_telegram(
     Sends a formatted notification to Telegram when a batch of questions needs answers.
     Security: Never logs or prints the bot token or chat ID.
     """
+    if not telegram_enabled():
+        return False
+
     token, chat_id = get_telegram_config()
     if not token or not chat_id:
-        print("[Telegram] Bot token or chat ID is not configured (or is a placeholder). Notification skipped.")
         return False
 
     if not questions:

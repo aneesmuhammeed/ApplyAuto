@@ -461,9 +461,10 @@ def is_intent_plausible(intent: str, label: str) -> bool:
 async def map_intent_to_profile(intent: str, profile: Dict[str, Any]) -> Optional[str]:
     """Map validated field intent to candidate profile facts."""
     full_name = profile.get("full_name", "")
-    parts = full_name.split()
-    first_name = parts[0] if parts else ""
-    last_name = " ".join(parts[1:]) if len(parts) > 1 else ""
+    parts = full_name.split() if full_name else []
+    first_name = profile.get("first_name") or (parts[0] if parts else "")
+    last_name = profile.get("last_name") or (" ".join(parts[1:]) if len(parts) > 1 else "")
+    city = profile.get("city") or profile.get("location", "")
 
     mapping = {
         "full_name": full_name,
@@ -471,7 +472,8 @@ async def map_intent_to_profile(intent: str, profile: Dict[str, Any]) -> Optiona
         "last_name": last_name or first_name,
         "email": profile.get("email", ""),
         "phone": profile.get("phone", ""),
-        "location": profile.get("location", ""),
+        "location": profile.get("location", "") or city,
+        "city": city,
         "linkedin": profile.get("linkedin_url", ""),
         "github": profile.get("github_url", ""),
         "portfolio": profile.get("portfolio_url", "") or profile.get("linkedin_url", "")
@@ -846,6 +848,22 @@ async def fill_form_on_page(
         if not clean_lbl or lbl_key in seen_question_labels:
             return
 
+        # Prevent duplicate / ghost questions for core identity fields that are already filled
+        if any(f.get("field", "").strip().lower() == lbl_key for f in result["fields_filled"]):
+            return
+
+        # If a core identity field already has a non-empty value in profile, don't ask as unknown
+        if is_intent_plausible("first_name", clean_lbl) and profile.get("first_name"):
+            return
+        if is_intent_plausible("last_name", clean_lbl) and profile.get("last_name"):
+            return
+        if is_intent_plausible("email", clean_lbl) and profile.get("email"):
+            return
+        if is_intent_plausible("phone", clean_lbl) and profile.get("phone"):
+            return
+        if is_intent_plausible("location", clean_lbl) and (profile.get("location") or profile.get("city")):
+            return
+
         seen_question_labels.add(lbl_key)
 
         # Generate stable, canonical slugified question key
@@ -1015,10 +1033,15 @@ async def fill_form_on_page(
                     any(w in label.lower() for w in ["location", "city"]) and not any(w in label.lower() for w in ["willing", "relocate", "prefer", "able to work", "office", "authorized", "require"])
                 )
                 if is_location_field:
+                    clean_city = profile.get("city")
                     loc_val = profile.get("location") or "Kochi, Kerala, India"
-                    city_search = loc_val.split(",")[0].strip() if "," in loc_val else loc_val
+                    city_search = clean_city or (loc_val.split(",")[0].strip() if "," in loc_val else loc_val)
                     cb_exec = widget_registry.get_executor(WidgetType.CUSTOM_COMBOBOX)
                     exec_res = await cb_exec.execute(ctx, el, city_search)
+                    if not exec_res.success and clean_city and loc_val != clean_city:
+                        # Fallback attempt with full loc_val or alternate part if city search yielded no match
+                        alt_search = loc_val.split(",")[-1].strip()
+                        exec_res = await cb_exec.execute(ctx, el, alt_search)
                     if exec_res.success:
                         val_str = str(exec_res.verified_value or city_search)
                         result["fields_filled"].append({

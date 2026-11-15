@@ -242,6 +242,45 @@ def init_db():
     conn.close()
 
 # Database helper functions
+def extract_clean_city_from_location(loc_str: str) -> str:
+    """
+    Extract a clean city name from a candidate's location string.
+    Filters out institutional and academic names (e.g. 'Govt. Model Engineering College, Kochi' -> 'Kochi').
+    """
+    if not loc_str or not loc_str.strip():
+        return ""
+    
+    parts = [p.strip() for p in loc_str.split(",") if p.strip()]
+    if not parts:
+        return ""
+
+    institutional_terms = [
+        "college", "university", "institute", "school", "campus", "hostel",
+        "hall", "academy", "polytechnic", "hospital", "govt", "government",
+        "engineering", "technology", "dept", "department"
+    ]
+    
+    country_state_terms = [
+        "india", "usa", "united states", "kerala", "karnataka", "tamil nadu",
+        "maharashtra", "telangana", "delhi", "california", "texas"
+    ]
+
+    # Look for candidate part that is not an institution and not a broad country
+    for p in parts:
+        p_low = p.lower()
+        if any(term in p_low for term in institutional_terms):
+            continue
+        if p_low in country_state_terms:
+            continue
+        return p
+
+    # Fallback to last part or first part if all else fails
+    for p in reversed(parts):
+        p_low = p.lower()
+        if not any(term in p_low for term in institutional_terms):
+            return p
+    return parts[0]
+
 def get_profile() -> Dict[str, Any]:
     conn = get_db_connection()
     row = conn.execute("SELECT * FROM profiles LIMIT 1").fetchone()
@@ -255,6 +294,24 @@ def get_profile() -> Dict[str, Any]:
                 d[field] = json.loads(d[field])
             except Exception:
                 d[field] = []
+
+    # Derive first_name and last_name from full_name if not explicitly set
+    full_name = (d.get("full_name") or "").strip()
+    name_parts = full_name.split() if full_name else []
+    first_name = name_parts[0] if name_parts else ""
+    last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
+
+    if not d.get("first_name"):
+        d["first_name"] = first_name
+    if not d.get("last_name"):
+        d["last_name"] = last_name or first_name
+
+    # Derive clean city from location
+    loc = d.get("location") or ""
+    clean_city = extract_clean_city_from_location(loc)
+    if not d.get("city"):
+        d["city"] = clean_city
+
     return d
 
 def update_profile(data: Dict[str, Any]):
