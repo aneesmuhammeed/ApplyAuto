@@ -1,14 +1,15 @@
 import os
 import re
-import hmac
+import secrets
 import uuid
 import shutil
 import asyncio
+from urllib.parse import urlparse
 from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from config import settings
 from database import (
@@ -24,18 +25,42 @@ def _write_file_sync(dest: str, data: bytes) -> None:
     with open(dest, "wb") as buffer:
         buffer.write(data)
 
+def is_safe_job_url(url: str) -> bool:
+    """Validate that job URL is HTTP/HTTPS and not pointing to local network/private addresses."""
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url.strip())
+        if parsed.scheme.lower() not in ("http", "https"):
+            return False
+        hostname = (parsed.hostname or "").lower()
+        if not hostname:
+            return False
+        # Block internal addresses and private loopbacks fed to Playwright
+        disallowed_hosts = [
+            "localhost", "127.0.0.1", "0.0.0.0", "::1", "169.254.169.254"
+        ]
+        if hostname in disallowed_hosts or hostname.endswith(".local") or hostname.endswith(".internal"):
+            return False
+        # Disallow RFC1918 private IP ranges if supplied directly as hostnames
+        if re.match(r'^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)', hostname):
+            return False
+        return True
+    except Exception:
+        return False
+
 app = FastAPI(title="ApplyMate Local API", version="2.0.0")
 
-# Security: Restrict CORS strictly to dashboard origins and local loopback
-allowed_origins = [
-    settings.DASHBOARD_ORIGIN,
-    "http://localhost:3000",
-    "http://127.0.0.1:3000"
-]
+# Security: Restrict CORS strictly to DASHBOARD_ORIGIN (no "*" with credentials)
+cors_origins = [settings.DASHBOARD_ORIGIN]
+if "http://localhost:3000" not in cors_origins:
+    cors_origins.append("http://localhost:3000")
+if "http://127.0.0.1:3000" not in cors_origins:
+    cors_origins.append("http://127.0.0.1:3000")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -43,33 +68,34 @@ app.add_middleware(
 
 os.makedirs(settings.RESUME_STORAGE_DIR, exist_ok=True)
 
-# Security: Authentication Middleware enforcing random token header created on first run
+# Security: Authentication Middleware enforcing X-API-Token / Bearer on every route
 @app.middleware("http")
 async def verify_token_header(request: Request, call_next):
     # 1. Allow CORS preflight requests
     if request.method == "OPTIONS":
         return await call_next(request)
 
-    # 2. Allow open health checks and OpenAPI docs
-    if request.url.path in ["/health", "/docs", "/openapi.json"]:
+    # 2. Allow open health check
+    if request.url.path == "/health":
         return await call_next(request)
 
-    # 3. Allow authorized dashboard origin / local loopback to bootstrap the token
+    # 3. Allow authorized dashboard origin to bootstrap token via Origin check
     if request.url.path == "/api/auth/token":
         origin = request.headers.get("origin")
-        client_host = request.client.host if request.client else ""
-        if origin in allowed_origins or client_host in ["127.0.0.1", "::1", "localhost"]:
+        sec_fetch_site = request.headers.get("sec-fetch-site")
+        # Origin MUST explicitly match the configured dashboard origin
+        if origin and origin in cors_origins:
             return JSONResponse({"status": "success", "token": settings.API_TOKEN})
-        return JSONResponse({"status": "error", "detail": "Unauthorized origin"}, status_code=403)
+        return JSONResponse({"status": "error", "detail": "Unauthorized origin for token bootstrap"}, status_code=403)
 
-    # 4. Require X-API-Token or Bearer Authorization header
+    # 4. Require X-API-Token or Bearer Authorization header using constant-time secrets.compare_digest
     token = request.headers.get("X-API-Token")
     if not token and "authorization" in request.headers:
         auth_val = request.headers["authorization"]
         if auth_val.lower().startswith("bearer "):
             token = auth_val[7:].strip()
 
-    if not token or not hmac.compare_digest(str(token), str(settings.API_TOKEN)):
+    if not token or not secrets.compare_digest(str(token), str(settings.API_TOKEN)):
         return JSONResponse(
             status_code=401,
             content={"status": "error", "detail": "Unauthorized: Invalid or missing X-API-Token header"}
@@ -81,6 +107,12 @@ async def verify_token_header(request: Request, call_next):
 class NewApplicationRequest(BaseModel):
     job_url: str
     company_name: str = ""
+
+    @field_validator("job_url")
+    def validate_url(cls, v):
+        if not is_safe_job_url(v):
+            raise ValueError("Invalid job URL. Must be a valid public HTTP or HTTPS address.")
+        return v.strip()
 
 class UpdateApplicationRequest(BaseModel):
     status: str = None

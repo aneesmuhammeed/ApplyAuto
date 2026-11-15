@@ -10,6 +10,8 @@ frontend/.env.*
 !frontend/.env.example
 api_token.txt
 .api_token
+storage/api_token.txt
+backend/storage/api_token.txt
 
 # Python & Node dependencies and build output
 __pycache__/
@@ -23,6 +25,10 @@ frontend/.next/
 dist/
 build/
 .pytest_cache/
+.venv/
+venv/
+ENV/
+env/
 
 # Local databases, uploads & browser profile
 *.db
@@ -39,6 +45,7 @@ storage/browser_profile/
 storage/resumes/
 storage/*.txt
 storage/*.pdf
+storage/*.docx
 storage/*.png
 storage/*_screenshot.png
 backend/storage/

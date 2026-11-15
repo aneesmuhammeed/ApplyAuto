@@ -1,13 +1,39 @@
 import os
 import secrets
 from pathlib import Path
-from dotenv import load_dotenv
 
-# Ensure .env is loaded from the backend directory regardless of where python is executed
+# Ensure .env is loaded safely handling BOM, CRLF, and quotes
 backend_dir = Path(__file__).parent.resolve()
 root_dir = backend_dir.parent.resolve()
 env_path = backend_dir / ".env"
-load_dotenv(dotenv_path=env_path)
+
+def safe_load_dotenv(path: Path) -> None:
+    """Load .env file with support for UTF-8-SIG (BOM), CRLF, and quoted values."""
+    if not path.is_file():
+        return
+    try:
+        content = path.read_text(encoding="utf-8-sig")
+    except Exception:
+        try:
+            content = path.read_text(encoding="latin-1")
+        except Exception:
+            return
+
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        # Strip matching quotes if wrapped
+        if len(val) >= 2 and ((val[0] == '"' and val[-1] == '"') or (val[0] == "'" and val[-1] == "'")):
+            val = val[1:-1]
+        # Do not overwrite variables already explicitly passed in environment
+        if key not in os.environ:
+            os.environ[key] = val
+
+safe_load_dotenv(env_path)
 
 # Absolute path to storage in project root so it never splits between directories
 storage_dir = root_dir / "storage"
@@ -26,13 +52,19 @@ def get_or_create_api_token(storage_path: Path) -> str:
             token = token_file.read_text(encoding="utf-8").strip()
             if token:
                 return token
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Security Warning] Could not read existing API token from {token_file}: {e}")
 
     # Create random token on first run
     new_token = secrets.token_hex(32)
     try:
+        # Write token file
         token_file.write_text(new_token, encoding="utf-8")
+        # Restrict permissions to read/write only by current owner (0o600)
+        try:
+            token_file.chmod(0o600)
+        except Exception:
+            pass
     except Exception as e:
         print(f"[Security Warning] Could not persist API token to {token_file}: {e}")
     return new_token
@@ -40,7 +72,13 @@ def get_or_create_api_token(storage_path: Path) -> str:
 class Settings:
     def __init__(self):
         self.SQLITE_DB_PATH: str = str(db_file)
-        self.POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL", "2"))
+        
+        # Robust integer parsing for POLL_INTERVAL
+        try:
+            self.POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL", "2"))
+        except (ValueError, TypeError):
+            self.POLL_INTERVAL: int = 2
+            
         self.RESUME_STORAGE_DIR: str = str(storage_dir)
         self.DASHBOARD_ORIGIN: str = os.getenv("DASHBOARD_ORIGIN", "http://localhost:3000")
         self.API_TOKEN: str = get_or_create_api_token(storage_dir)
@@ -64,12 +102,14 @@ class Settings:
     @property
     def LLM_CONFIDENCE_THRESHOLD(self) -> float:
         try:
-            return float(os.getenv("LLM_CONFIDENCE_THRESHOLD", "0.5"))
+            val = float(os.getenv("LLM_CONFIDENCE_THRESHOLD", "0.8"))
+            return max(0.0, min(1.0, val))
         except (ValueError, TypeError):
-            return 0.5
+            return 0.8
 
     @property
     def HEADLESS_BROWSER(self) -> bool:
-        return os.getenv("HEADLESS_BROWSER", "False").lower() in ("true", "1", "yes")
+        val = str(os.getenv("HEADLESS_BROWSER", "False")).strip().lower()
+        return val in ("true", "1", "yes", "on")
 
 settings = Settings()

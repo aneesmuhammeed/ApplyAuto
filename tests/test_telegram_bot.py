@@ -165,5 +165,45 @@ class TestTelegramBotHardening(unittest.TestCase):
         """telegram_enabled rejects template placeholders immediately without network calls."""
         self.assertFalse(telegram_enabled())
 
+    def test_telegram_message_splitting(self):
+        """Messages exceeding Telegram character limit must be split safely into chunks."""
+        from telegram_bot import split_telegram_message
+        long_text = "line " * 1500  # ~7500 chars
+        chunks = split_telegram_message(long_text, max_chunk=4000)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), 4000)
+
+    def test_verify_and_process_callback_query(self):
+        """Callback queries from unauthorized senders must be blocked; authorized must pass."""
+        with patch.dict(os.environ, {
+            "TELEGRAM_BOT_TOKEN": "123456789:ABCdefGHIjklMNOpqrsTUVwxyz_123456",
+            "TELEGRAM_CHAT_ID": "987654321"
+        }):
+            # Unauthorized callback query
+            unauth_cb = {
+                "callback_query": {
+                    "id": "cb1",
+                    "from": {"id": 111222333},
+                    "message": {"message_id": 42, "chat": {"id": 111222333}},
+                    "data": "approve_app_123"
+                }
+            }
+            self.assertIsNone(verify_and_process_telegram_reply(unauth_cb))
+
+            # Authorized callback query
+            auth_cb = {
+                "callback_query": {
+                    "id": "cb2",
+                    "from": {"id": 987654321},
+                    "message": {"message_id": 42, "chat": {"id": 987654321}},
+                    "data": "approve_app_123"
+                }
+            }
+            res = verify_and_process_telegram_reply(auth_cb)
+            self.assertIsNotNone(res)
+            self.assertEqual(res["type"], "callback_query")
+            self.assertEqual(res["data"], "approve_app_123")
+
 if __name__ == "__main__":
     unittest.main()

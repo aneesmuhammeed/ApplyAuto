@@ -82,24 +82,48 @@ def answer_application_cli(target_id: str = None):
         print(f"[{idx}/{len(questions)}] Question: {lbl}")
         print(f"      Type: {q_type}")
         if opts:
-            print(f"      Options: {opts}")
+            print("      Options:")
+            for o_idx, opt in enumerate(opts, 1):
+                print(f"        [{o_idx}] {opt}")
         if ai_sug:
             print(f"      AI Suggestion: '{ai_sug}'")
 
-        # 1. Ask for Answer
+        # 1. Ask for Answer (handles empty, indices, or free text gracefully)
         prompt_text = f"      Your Answer"
         if ai_sug:
             prompt_text += f" [Default: '{ai_sug}']"
+        elif opts:
+            prompt_text += f" [1-{len(opts)} or option text]"
         prompt_text += ": "
 
-        raw_ans = input(prompt_text).strip()
-        final_ans = raw_ans if raw_ans else (ai_sug or (opts[0] if opts else ""))
+        try:
+            raw_ans = input(prompt_text).strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\n\nOperation cancelled by user. Exiting without saving changes.")
+            return
+
+        final_ans = ""
+        if not raw_ans:
+            final_ans = ai_sug or (str(opts[0]) if opts else "")
+        elif opts and raw_ans.isdigit():
+            chosen_idx = int(raw_ans) - 1
+            if 0 <= chosen_idx < len(opts):
+                final_ans = str(opts[chosen_idx])
+            else:
+                print(f"      [!] Index out of range; using raw text: '{raw_ans}'")
+                final_ans = raw_ans
+        else:
+            final_ans = raw_ans
 
         # 2. Ask for Scope: Every site vs Just this company
         print(f"      Apply this answer to:")
         print(f"        [1] Every site (Global)")
         print(f"        [2] Just this company ({company_name})")
-        scope_choice = input(f"      Choice (1 or 2) [Default: {'2' if def_scope_str == 'this company' else '1'}]: ").strip()
+        try:
+            scope_choice = input(f"      Choice (1 or 2) [Default: {'2' if def_scope_str == 'this company' else '1'}]: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\n\nOperation cancelled by user. Exiting without saving changes.")
+            return
 
         if scope_choice == "2":
             final_scope = "this company"
@@ -109,7 +133,12 @@ def answer_application_cli(target_id: str = None):
             final_scope = def_scope_str
 
         # 3. Ask for Save to Memory
-        save_choice = input("      Save to Answer Memory? [Y/n, Default: Y]: ").strip().lower()
+        try:
+            save_choice = input("      Save to Answer Memory? [Y/n, Default: Y]: ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print("\n\nOperation cancelled by user. Exiting without saving changes.")
+            return
+
         save_for_future = False if save_choice == "n" else True
 
         # Save to SQLite saved_answers immediately if requested
